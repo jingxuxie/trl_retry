@@ -84,6 +84,11 @@ flags.DEFINE_float(
     0.5,
     "Transitive source-goal lower distance bound as a fraction of budget.",
 )
+flags.DEFINE_integer(
+    "num_trans_witnesses",
+    1,
+    "Number of geodesic-valid witnesses per transitive parent.",
+)
 flags.DEFINE_bool(
     "fail_on_threshold",
     False,
@@ -309,13 +314,25 @@ def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size,
     goals = []
     value_budgets = []
     value_offsets = []
-    midpoint_observations = []
-    midpoint_actions = []
-    midpoint_goals = []
-    midpoint_offsets = []
+    witness_observations = []
+    witness_actions = []
+    witness_goals = []
+    witness_offsets = []
     left_budgets = []
     right_budgets = []
     trans_valids = []
+    parent_distances = []
+    left_distances = []
+    right_distances = []
+    left_slacks = []
+    right_slacks = []
+    witness_cell_counts = []
+    unique_witness_fracs = []
+    trans_parent_oracle_labels = []
+    trans_branch_oracle_valids = []
+    num_witnesses = int(FLAGS.num_trans_witnesses)
+    if num_witnesses < 1:
+        raise ValueError("--num_trans_witnesses must be >= 1.")
 
     attempts = 0
     max_attempts = max(1000, int(batch_size) * 200)
@@ -354,21 +371,73 @@ def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size,
         if len(witness_cells) == 0:
             continue
 
-        witness_cell = int(rng.choice(witness_cells))
+        replace = len(witness_cells) < num_witnesses
+        sampled_witness_cells = rng.choice(
+            witness_cells, size=num_witnesses, replace=replace
+        )
         goal_idx = int(rng.choice(state_by_cell[goal_cell]))
-        witness_idx = int(rng.choice(state_by_cell[witness_cell]))
         observations.append(np.asarray(dataset["observations"])[src_idx])
         actions.append(np.asarray(dataset["actions"])[src_idx])
         goals.append(np.asarray(dataset["observations"])[goal_idx])
         value_budgets.append(budget)
-        value_offsets.append(float(src_distances[goal_cell]))
-        midpoint_observations.append(np.asarray(dataset["observations"])[witness_idx])
-        midpoint_actions.append(np.asarray(dataset["actions"])[witness_idx])
-        midpoint_goals.append(np.asarray(dataset["observations"])[witness_idx])
-        midpoint_offsets.append(float(src_distances[witness_cell]))
-        left_budgets.append(left_budget)
-        right_budgets.append(right_budget)
-        trans_valids.append(1.0)
+        parent_distance = float(src_distances[goal_cell])
+        value_offsets.append(parent_distance)
+        parent_distances.append(parent_distance)
+        witness_cell_counts.append(float(len(witness_cells)))
+        unique_witness_fracs.append(
+            float(len(np.unique(sampled_witness_cells)) / float(num_witnesses))
+        )
+        trans_parent_oracle_labels.append(float(parent_distance <= float(budget)))
+
+        parent_witness_observations = []
+        parent_witness_actions = []
+        parent_witness_goals = []
+        parent_witness_offsets = []
+        parent_left_budgets = []
+        parent_right_budgets = []
+        parent_valids = []
+        parent_left_distances = []
+        parent_right_distances = []
+        parent_left_slacks = []
+        parent_right_slacks = []
+        parent_branch_oracle_valids = []
+        for witness_cell in sampled_witness_cells:
+            witness_cell = int(witness_cell)
+            witness_idx = int(rng.choice(state_by_cell[witness_cell]))
+            left_distance = float(src_distances[witness_cell])
+            right_distance = float(step_distances[witness_cell, goal_cell])
+            parent_witness_observations.append(
+                np.asarray(dataset["observations"])[witness_idx]
+            )
+            parent_witness_actions.append(np.asarray(dataset["actions"])[witness_idx])
+            parent_witness_goals.append(np.asarray(dataset["observations"])[witness_idx])
+            parent_witness_offsets.append(left_distance)
+            parent_left_budgets.append(left_budget)
+            parent_right_budgets.append(right_budget)
+            parent_valids.append(1.0)
+            parent_left_distances.append(left_distance)
+            parent_right_distances.append(right_distance)
+            parent_left_slacks.append(float(left_budget) - left_distance)
+            parent_right_slacks.append(float(right_budget) - right_distance)
+            parent_branch_oracle_valids.append(
+                float(
+                    left_distance <= float(left_budget)
+                    and right_distance <= float(right_budget)
+                )
+            )
+
+        witness_observations.append(parent_witness_observations)
+        witness_actions.append(parent_witness_actions)
+        witness_goals.append(parent_witness_goals)
+        witness_offsets.append(parent_witness_offsets)
+        left_budgets.append(parent_left_budgets)
+        right_budgets.append(parent_right_budgets)
+        trans_valids.append(parent_valids)
+        left_distances.append(parent_left_distances)
+        right_distances.append(parent_right_distances)
+        left_slacks.append(parent_left_slacks)
+        right_slacks.append(parent_right_slacks)
+        trans_branch_oracle_valids.append(parent_branch_oracle_valids)
 
     if len(observations) < int(batch_size):
         raise ValueError(
@@ -382,14 +451,164 @@ def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size,
         value_goals=np.asarray(goals, dtype=np.float32),
         value_budgets=np.asarray(value_budgets, dtype=np.int32),
         value_offsets=np.rint(value_offsets).astype(np.int32),
-        value_midpoint_observations=np.asarray(midpoint_observations, dtype=np.float32),
-        value_midpoint_actions=np.asarray(midpoint_actions, dtype=np.float32),
-        value_midpoint_goals=np.asarray(midpoint_goals, dtype=np.float32),
-        value_midpoint_offsets=np.rint(midpoint_offsets).astype(np.int32),
-        value_left_budgets=np.asarray(left_budgets, dtype=np.int32),
-        value_right_budgets=np.asarray(right_budgets, dtype=np.int32),
-        trans_valids=np.asarray(trans_valids, dtype=np.float32),
+        value_midpoint_observations=np.swapaxes(
+            np.asarray(witness_observations, dtype=np.float32), 0, 1
+        ),
+        value_midpoint_actions=np.swapaxes(
+            np.asarray(witness_actions, dtype=np.float32), 0, 1
+        ),
+        value_midpoint_goals=np.swapaxes(
+            np.asarray(witness_goals, dtype=np.float32), 0, 1
+        ),
+        value_midpoint_offsets=np.rint(
+            np.swapaxes(np.asarray(witness_offsets, dtype=np.float32), 0, 1)
+        ).astype(np.int32),
+        value_left_budgets=np.swapaxes(np.asarray(left_budgets, dtype=np.int32), 0, 1),
+        value_right_budgets=np.swapaxes(
+            np.asarray(right_budgets, dtype=np.int32), 0, 1
+        ),
+        trans_valids=np.swapaxes(np.asarray(trans_valids, dtype=np.float32), 0, 1),
+        trans_parent_distances=np.asarray(parent_distances, dtype=np.float32),
+        trans_left_distances=np.swapaxes(
+            np.asarray(left_distances, dtype=np.float32), 0, 1
+        ),
+        trans_right_distances=np.swapaxes(
+            np.asarray(right_distances, dtype=np.float32), 0, 1
+        ),
+        trans_left_slacks=np.swapaxes(np.asarray(left_slacks, dtype=np.float32), 0, 1),
+        trans_right_slacks=np.swapaxes(
+            np.asarray(right_slacks, dtype=np.float32), 0, 1
+        ),
+        trans_witness_cell_counts=np.asarray(witness_cell_counts, dtype=np.float32),
+        trans_unique_witness_fracs=np.asarray(unique_witness_fracs, dtype=np.float32),
+        trans_parent_oracle_labels=np.asarray(
+            trans_parent_oracle_labels, dtype=np.float32
+        ),
+        trans_branch_oracle_valids=np.swapaxes(
+            np.asarray(trans_branch_oracle_valids, dtype=np.float32), 0, 1
+        ),
+        trans_sample_acceptance_rate=np.asarray(
+            float(len(observations)) / float(max(attempts, 1)), dtype=np.float32
+        ),
+        trans_attempts_per_sample=np.asarray(
+            float(attempts) / float(max(len(observations), 1)), dtype=np.float32
+        ),
     )
+
+
+def finite_mean(values):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return np.nan
+    finite = np.isfinite(values)
+    if not finite.any():
+        return np.nan
+    return float(values[finite].mean())
+
+
+def coarse_hist(values, bins):
+    values = np.asarray(values, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    counts, edges = np.histogram(finite, bins=np.asarray(bins, dtype=np.float64))
+    return dict(
+        counts=[int(x) for x in counts],
+        edges=[float(x) for x in edges],
+        total=int(len(finite)),
+    )
+
+
+def summarize_transitive_batch(trans_batch, budgets):
+    if trans_batch is None:
+        return None
+    value_budgets = np.asarray(trans_batch["value_budgets"])
+    parent_distances = np.asarray(trans_batch["trans_parent_distances"])
+    left_distances = np.asarray(trans_batch["trans_left_distances"])
+    right_distances = np.asarray(trans_batch["trans_right_distances"])
+    left_slacks = np.asarray(trans_batch["trans_left_slacks"])
+    right_slacks = np.asarray(trans_batch["trans_right_slacks"])
+    left_budgets = np.asarray(trans_batch["value_left_budgets"])
+    right_budgets = np.asarray(trans_batch["value_right_budgets"])
+    trans_valids = np.asarray(trans_batch["trans_valids"]) > 0
+
+    rows = []
+    histograms = {}
+    ratio_bins = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, np.inf]
+    slack_bins = [-np.inf, -1e-6, 0.0, 5.0, 10.0, 20.0, 40.0, np.inf]
+    for budget in budgets:
+        budget = int(budget)
+        parent_mask = value_budgets == budget
+        witness_mask = trans_valids & parent_mask[None, :]
+        if not parent_mask.any():
+            continue
+        left_budget = max(1, budget // 2)
+        right_budget = max(1, budget - left_budget)
+        rows.append(
+            dict(
+                budget=budget,
+                count=int(parent_mask.sum()),
+                trans_budget_count=int(parent_mask.sum()),
+                parent_distance_mean=finite_mean(parent_distances[parent_mask]),
+                left_distance_mean=finite_mean(left_distances[witness_mask]),
+                right_distance_mean=finite_mean(right_distances[witness_mask]),
+                left_slack_mean=finite_mean(left_slacks[witness_mask]),
+                right_slack_mean=finite_mean(right_slacks[witness_mask]),
+                witness_cell_count_mean=finite_mean(
+                    np.asarray(trans_batch["trans_witness_cell_counts"])[parent_mask]
+                ),
+                unique_witness_frac=finite_mean(
+                    np.asarray(trans_batch["trans_unique_witness_fracs"])[parent_mask]
+                ),
+                zero_left_frac=finite_mean(
+                    (left_distances[witness_mask] <= 1e-6).astype(np.float32)
+                ),
+                zero_right_frac=finite_mean(
+                    (right_distances[witness_mask] <= 1e-6).astype(np.float32)
+                ),
+                parent_oracle_label_mean=finite_mean(
+                    np.asarray(trans_batch["trans_parent_oracle_labels"])[parent_mask]
+                ),
+                branch_oracle_valid_mean=finite_mean(
+                    np.asarray(trans_batch["trans_branch_oracle_valids"])[witness_mask]
+                ),
+            )
+        )
+        histograms[str(budget)] = dict(
+            parent_distance_over_H=coarse_hist(
+                parent_distances[parent_mask] / float(max(budget, 1)), ratio_bins
+            ),
+            left_distance_over_h=coarse_hist(
+                left_distances[witness_mask] / float(max(left_budget, 1)), ratio_bins
+            ),
+            right_distance_over_H_minus_h=coarse_hist(
+                right_distances[witness_mask] / float(max(right_budget, 1)), ratio_bins
+            ),
+            left_slack=coarse_hist(left_slacks[witness_mask], slack_bins),
+            right_slack=coarse_hist(right_slacks[witness_mask], slack_bins),
+        )
+
+    return dict(
+        trans_sample_acceptance_rate=float(
+            np.asarray(trans_batch["trans_sample_acceptance_rate"])
+        ),
+        trans_attempts_per_sample=float(
+            np.asarray(trans_batch["trans_attempts_per_sample"])
+        ),
+        num_trans_witnesses=int(np.asarray(trans_valids).shape[0]),
+        budget_rows=rows,
+        histograms=histograms,
+    )
+
+
+def info_to_float_dict(info):
+    result = {}
+    for key, value in info.items():
+        try:
+            arr = np.asarray(value)
+            if arr.shape == ():
+                result[key] = float(arr)
+        except (TypeError, ValueError):
+            pass
+    return result
 
 
 def score_sup_batch(agent, batch, budgets):
@@ -520,6 +739,40 @@ def print_report(title, step, report, mono=None, loss=None):
         )
 
 
+def print_transitive_summary(summary, info):
+    if summary is None:
+        return
+    ratio = info.get("critic/loss_trans_over_sup", np.nan)
+    print(
+        "trans | "
+        f"accept={format_metric(summary['trans_sample_acceptance_rate'])} | "
+        f"attempts/sample={format_metric(summary['trans_attempts_per_sample'])} | "
+        f"K={summary['num_trans_witnesses']} | "
+        f"loss_trans/sup={format_metric(ratio)}"
+    )
+    print(
+        "H | parents | parent_d | left_d | right_d | left_slack | right_slack | "
+        "w_cells | uniq_w | zero_l | zero_r"
+    )
+    print(
+        "--|---------|----------|--------|---------|------------|-------------|"
+        "---------|--------|--------|-------"
+    )
+    for row in summary["budget_rows"]:
+        print(
+            f"{row['budget']:4d} | {row['trans_budget_count']:7d} | "
+            f"{format_metric(row['parent_distance_mean'])} | "
+            f"{format_metric(row['left_distance_mean'])} | "
+            f"{format_metric(row['right_distance_mean'])} | "
+            f"{format_metric(row['left_slack_mean'])} | "
+            f"{format_metric(row['right_slack_mean'])} | "
+            f"{format_metric(row['witness_cell_count_mean'])} | "
+            f"{format_metric(row['unique_witness_frac'])} | "
+            f"{format_metric(row['zero_left_frac'])} | "
+            f"{format_metric(row['zero_right_frac'])}"
+        )
+
+
 def context_metadata(context):
     if context["kind"] == "grid_geodesic":
         return dict(
@@ -563,6 +816,7 @@ def main(_):
     print(f"  label_type: {context['kind']}")
     print(f"  budgets: {budgets}")
     print(f"  lambda_trans: {FLAGS.lambda_trans}")
+    print(f"  num_trans_witnesses: {FLAGS.num_trans_witnesses}")
     print(f"  context: {context_metadata(context)}")
 
     dataset_class = {"GCDataset": GCDataset}[config["dataset"]["dataset_class"]]
@@ -583,20 +837,23 @@ def main(_):
     eval_report = score_sup_batch(agent, eval_batch, budgets)
     eval_mono = monotonicity_violation(agent, eval_batch, budgets)
     print_report("eval", 0, eval_report, mono=eval_mono)
+    transitive_history = []
+    last_update_info = {}
+    last_transitive_summary = None
 
     for step in range(1, FLAGS.steps + 1):
         train_batch = gc_train.sample(config.batch_size)
+        transitive_fields = None
         if FLAGS.lambda_trans > 0.0:
-            train_batch.update(
-                sample_grid_transitive_v_pairs(
-                    train_dataset,
-                    context,
-                    "train",
-                    budgets,
-                    config.batch_size,
-                    rng,
-                )
+            transitive_fields = sample_grid_transitive_v_pairs(
+                train_dataset,
+                context,
+                "train",
+                budgets,
+                config.batch_size,
+                rng,
             )
+            train_batch.update(transitive_fields)
         train_batch.update(
             make_sup_fields(
                 train_dataset,
@@ -608,13 +865,22 @@ def main(_):
             )
         )
         agent, info = agent.update(train_batch)
+        last_update_info = info_to_float_dict(info)
         final_loss = float(info["critic/loss_sup"])
         if step % FLAGS.eval_interval == 0 or step == FLAGS.steps:
             train_report = score_sup_batch(agent, train_batch, budgets)
             eval_report = score_sup_batch(agent, eval_batch, budgets)
             train_mono = monotonicity_violation(agent, train_batch, budgets)
             eval_mono = monotonicity_violation(agent, eval_batch, budgets)
+            last_transitive_summary = summarize_transitive_batch(
+                transitive_fields, budgets
+            )
+            if last_transitive_summary is not None:
+                transitive_history.append(
+                    dict(step=int(step), train=last_transitive_summary)
+                )
             print_report("train", step, train_report, mono=train_mono, loss=final_loss)
+            print_transitive_summary(last_transitive_summary, last_update_info)
             print_report("eval", step, eval_report, mono=eval_mono)
 
     final_passed = passed(eval_report, budgets)
@@ -623,6 +889,9 @@ def main(_):
         train=train_report,
         eval=eval_report,
         eval_monotonicity_violation=eval_mono,
+        last_update_info=last_update_info,
+        last_transitive_summary=last_transitive_summary,
+        transitive_history=transitive_history,
         passed=bool(final_passed),
         config=dict(
             env_name=FLAGS.env_name,
@@ -635,6 +904,7 @@ def main(_):
             final_loss_sup=final_loss,
             lambda_trans=float(FLAGS.lambda_trans),
             trans_pos_boundary_frac=float(FLAGS.trans_pos_boundary_frac),
+            num_trans_witnesses=int(FLAGS.num_trans_witnesses),
             context=context_metadata(context),
         ),
     )

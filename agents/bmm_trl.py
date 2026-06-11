@@ -163,7 +163,14 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
         )
 
     def critic_logits_for_pair_grid(
-        self, observations, actions, goals, budgets, offsets=None, grad_params=None
+        self,
+        observations,
+        actions,
+        goals,
+        budgets,
+        offsets=None,
+        grad_params=None,
+        target=False,
     ):
         budgets = jnp.asarray(budgets)
         leading_shape = budgets.shape
@@ -184,6 +191,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             flat_budgets,
             offsets=flat_offsets,
             grad_params=grad_params,
+            target=target,
         )
         return jnp.reshape(flat_logits, flat_logits.shape[:1] + leading_shape)
 
@@ -209,30 +217,74 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
         )
         r = jax.nn.sigmoid(r_logits)
 
-        first_logits = self.critic_logits_for(
-            batch["observations"],
-            batch["actions"],
-            batch["value_midpoint_goals"],
-            batch["value_left_budgets"],
-            offsets=batch.get("value_midpoint_offsets", batch["value_left_budgets"]),
-            target=True,
-        )
-        first_r = jax.nn.sigmoid(first_logits)
+        if batch["value_midpoint_goals"].ndim == batch[goal_key].ndim + 1:
+            witness_goals = batch["value_midpoint_goals"]
+            witness_shape = witness_goals.shape[:-1]
+            parent_observations = jnp.broadcast_to(
+                batch["observations"][None, ...],
+                witness_shape + batch["observations"].shape[-1:],
+            )
+            parent_actions = jnp.broadcast_to(
+                batch["actions"][None, ...],
+                witness_shape + batch["actions"].shape[-1:],
+            )
+            parent_goals = jnp.broadcast_to(
+                batch[goal_key][None, ...], witness_shape + batch[goal_key].shape[-1:]
+            )
+            first_logits = self.critic_logits_for_pair_grid(
+                parent_observations,
+                parent_actions,
+                witness_goals,
+                batch["value_left_budgets"],
+                offsets=batch.get(
+                    "value_midpoint_offsets", batch["value_left_budgets"]
+                ),
+                target=True,
+            )
+            second_logits = self.critic_logits_for_pair_grid(
+                batch["value_midpoint_observations"],
+                batch["value_midpoint_actions"],
+                parent_goals,
+                batch["value_right_budgets"],
+                offsets=batch["value_right_budgets"],
+                target=True,
+            )
+            first_r = jax.nn.sigmoid(first_logits)
+            second_r = jax.nn.sigmoid(second_logits)
+            witness_valids = jnp.asarray(
+                batch["trans_valids"], dtype=first_r.dtype
+            )
+            y_candidates = jnp.minimum(first_r, second_r)
+            y_candidates = jnp.where(witness_valids[None, ...] > 0, y_candidates, -1.0)
+            y_trans = jax.lax.stop_gradient(jnp.max(y_candidates, axis=1))
+            trans_valids = (witness_valids.max(axis=0) > 0).astype(r_logits.dtype)
+        else:
+            first_logits = self.critic_logits_for(
+                batch["observations"],
+                batch["actions"],
+                batch["value_midpoint_goals"],
+                batch["value_left_budgets"],
+                offsets=batch.get(
+                    "value_midpoint_offsets", batch["value_left_budgets"]
+                ),
+                target=True,
+            )
+            first_r = jax.nn.sigmoid(first_logits)
 
-        second_logits = self.critic_logits_for(
-            batch["value_midpoint_observations"],
-            batch["value_midpoint_actions"],
-            batch[goal_key],
-            batch["value_right_budgets"],
-            offsets=batch["value_right_budgets"],
-            target=True,
-        )
-        second_r = jax.nn.sigmoid(second_logits)
+            second_logits = self.critic_logits_for(
+                batch["value_midpoint_observations"],
+                batch["value_midpoint_actions"],
+                batch[goal_key],
+                batch["value_right_budgets"],
+                offsets=batch["value_right_budgets"],
+                target=True,
+            )
+            second_r = jax.nn.sigmoid(second_logits)
 
-        y_trans = jax.lax.stop_gradient(jnp.minimum(first_r, second_r))
-        loss_trans = masked_mean(
-            self.bce_loss(r_logits, y_trans), batch["trans_valids"]
-        )
+            witness_valids = jnp.asarray(batch["trans_valids"], dtype=first_r.dtype)
+            y_trans = jax.lax.stop_gradient(jnp.minimum(first_r, second_r))
+            trans_valids = witness_valids
+        loss_trans = masked_mean(self.bce_loss(r_logits, y_trans), trans_valids)
         loss_pos = self.bce_loss(r_logits, jnp.ones_like(r_logits)).mean()
 
         neg_logits = self.critic_logits_for(
@@ -346,6 +398,8 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             loss_rank = jnp.asarray(0.0, dtype=r_logits.dtype)
             rank_gap_mean = jnp.asarray(0.0, dtype=r_logits.dtype)
 
+        loss_trans_over_sup = loss_trans / jnp.maximum(loss_sup, 1e-8)
+
         total_loss = (
             self.config["lambda_trans"] * loss_trans
             + self.config["lambda_pos"] * loss_pos
@@ -378,10 +432,11 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             "loss_mono": loss_mono,
             "loss_sup": loss_sup,
             "loss_rank": loss_rank,
+            "loss_trans_over_sup": loss_trans_over_sup,
             "r_mean": r.mean(),
             "r_min": r.min(),
             "r_max": r.max(),
-            "y_trans_mean": masked_mean(y_trans, batch["trans_valids"]),
+            "y_trans_mean": masked_mean(y_trans, trans_valids),
             "first_r_mean": first_r.mean(),
             "second_r_mean": second_r.mean(),
             "pos_r_mean": r.mean(),
@@ -389,7 +444,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             "hard_neg_r_mean": masked_mean(hard_neg_r, hard_neg_valids),
             "rand_r_mean": rand_r.mean(),
             "mono_violation": (low_r > high_r).mean(),
-            "trans_valid_frac": batch["trans_valids"].mean(),
+            "trans_valid_frac": trans_valids.mean(),
             "neg_valid_frac": batch["value_neg_valids"].mean(),
             "hard_neg_valid_frac": hard_neg_valids.mean(),
             "hard_neg_budget_mean": masked_mean(hard_neg_budgets, hard_neg_valids),
@@ -420,6 +475,48 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
                 info[f"sup_valid_frac_H={int(budget)}"] = (
                     sup_valids * budget_mask
                 ).mean()
+                info[f"loss_sup_H={int(budget)}"] = masked_mean(
+                    self.bce_loss(sup_logits, sup_labels), sup_valids * budget_mask
+                )
+
+        for budget in config_budgets(self.config):
+            budget_mask = (
+                jnp.asarray(batch["value_budgets"]) == int(budget)
+            ).astype(r_logits.dtype)
+            trans_mask = trans_valids * budget_mask
+            if witness_valids.ndim == 2:
+                witness_budget_mask = (
+                    jnp.asarray(batch["value_budgets"])[None, :] == int(budget)
+                ).astype(first_r.dtype)
+                branch_mask = witness_valids * witness_budget_mask
+            else:
+                branch_mask = trans_mask
+            loss_trans_h = masked_mean(
+                self.bce_loss(r_logits, y_trans), trans_mask
+            )
+            info[f"y_trans_mean_H={int(budget)}"] = masked_mean(y_trans, trans_mask)
+            info[f"first_r_mean_H={int(budget)}"] = masked_mean(first_r, branch_mask)
+            info[f"second_r_mean_H={int(budget)}"] = masked_mean(second_r, branch_mask)
+            info[f"parent_r_mean_H={int(budget)}"] = masked_mean(r, trans_mask)
+            info[f"loss_trans_H={int(budget)}"] = loss_trans_h
+            if f"loss_sup_H={int(budget)}" in info:
+                info[f"loss_trans_over_sup_H={int(budget)}"] = loss_trans_h / jnp.maximum(
+                    info[f"loss_sup_H={int(budget)}"], 1e-8
+                )
+
+        if "trans_parent_oracle_labels" in batch:
+            info["trans_parent_oracle_label_mean"] = masked_mean(
+                jnp.asarray(batch["trans_parent_oracle_labels"], dtype=r_logits.dtype),
+                trans_valids,
+            )
+        if "trans_branch_oracle_valids" in batch:
+            branch_oracle_valids = jnp.asarray(
+                batch["trans_branch_oracle_valids"], dtype=first_r.dtype
+            )
+            info["trans_branch_oracle_valid_mean"] = masked_mean(
+                branch_oracle_valids,
+                witness_valids if witness_valids.ndim == branch_oracle_valids.ndim else trans_valids,
+            )
 
         return total_loss, info
 

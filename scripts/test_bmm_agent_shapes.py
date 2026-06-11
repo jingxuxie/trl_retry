@@ -144,6 +144,38 @@ def main():
     for key, value in state_info.items():
         assert bool(jnp.all(jnp.isfinite(value))), f"Non-finite metric {key}: {value}"
 
+    multi_witness_batch = dict(state_batch)
+    for key in (
+        "value_midpoint_observations",
+        "value_midpoint_actions",
+        "value_midpoint_goals",
+        "value_midpoint_offsets",
+        "value_left_budgets",
+        "value_right_budgets",
+        "trans_valids",
+    ):
+        multi_witness_batch[key] = np.stack([state_batch[key], state_batch[key]], axis=0)
+    multi_witness_batch["trans_parent_oracle_labels"] = np.ones(
+        state_config.batch_size, dtype=np.float32
+    )
+    multi_witness_batch["trans_branch_oracle_valids"] = np.ones(
+        (2, state_config.batch_size), dtype=np.float32
+    )
+    multi_witness_agent = BMMTRLAgent.create(8, state_example_batch, state_config)
+    _, multi_witness_info = multi_witness_agent.update(multi_witness_batch)
+    for key in (
+        "critic/loss_trans_over_sup",
+        "critic/y_trans_mean_H=1",
+        "critic/first_r_mean_H=1",
+        "critic/second_r_mean_H=1",
+        "critic/parent_r_mean_H=1",
+        "critic/trans_parent_oracle_label_mean",
+        "critic/trans_branch_oracle_valid_mean",
+    ):
+        assert key in multi_witness_info, f"Missing multi-witness metric {key}"
+    for key, value in multi_witness_info.items():
+        assert bool(jnp.all(jnp.isfinite(value))), f"Non-finite metric {key}: {value}"
+
     oracle_config = make_config()
     oracle_config.oracle_offset_feature = True
     oracle_config.value_only = True
