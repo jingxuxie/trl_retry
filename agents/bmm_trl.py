@@ -284,6 +284,12 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             witness_valids = jnp.asarray(batch["trans_valids"], dtype=first_r.dtype)
             y_trans = jax.lax.stop_gradient(jnp.minimum(first_r, second_r))
             trans_valids = witness_valids
+
+        target_mask = trans_valids
+        while target_mask.ndim < y_trans.ndim:
+            target_mask = target_mask[None, ...]
+        y_trans = jnp.clip(y_trans, 0.0, 1.0)
+        y_trans = jnp.where(target_mask > 0, y_trans, 0.0)
         loss_trans = masked_mean(self.bce_loss(r_logits, y_trans), trans_valids)
         loss_pos = self.bce_loss(r_logits, jnp.ones_like(r_logits)).mean()
 

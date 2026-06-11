@@ -89,6 +89,32 @@ flags.DEFINE_integer(
     1,
     "Number of geodesic-valid witnesses per transitive parent.",
 )
+flags.DEFINE_enum(
+    "trans_witness_mode",
+    "avoid_endpoints",
+    ["uniform_valid", "avoid_endpoints", "slack_balanced", "boundary_balanced"],
+    "How to choose valid transitive witnesses.",
+)
+flags.DEFINE_float(
+    "trans_endpoint_epsilon",
+    1e-6,
+    "Distance threshold below which a transitive witness is treated as an endpoint.",
+)
+flags.DEFINE_float(
+    "trans_boundary_beta",
+    0.25,
+    "Minimum branch-distance fraction for boundary_balanced witness sampling.",
+)
+flags.DEFINE_integer(
+    "sup_pairs_per_budget",
+    0,
+    "Direct supervised pairs per budget per update; <=0 uses --batch_size.",
+)
+flags.DEFINE_integer(
+    "trans_pairs_per_update",
+    0,
+    "Transitive parent tuples per update; <=0 uses --batch_size.",
+)
 flags.DEFINE_bool(
     "fail_on_threshold",
     False,
@@ -107,6 +133,13 @@ def parse_budgets(value):
     if not budgets:
         raise ValueError("--budgets must contain at least one budget.")
     return budgets
+
+
+def positive_or_default(value, default, name):
+    value = int(value)
+    if value <= 0:
+        return int(default)
+    return value
 
 
 def dataset_path_from_dir(dataset_dir):
@@ -294,6 +327,78 @@ def make_sup_fields(dataset, context, split, budgets, pairs_per_budget, rng):
     )
 
 
+def select_witness_cells(
+    witness_mask,
+    left_distance,
+    right_distance,
+    left_budget,
+    right_budget,
+    num_witnesses,
+    rng,
+):
+    """Select valid witness cells according to the configured transitive mode."""
+    witness_cells = np.nonzero(witness_mask)[0]
+    if len(witness_cells) == 0:
+        return None
+
+    eps = float(FLAGS.trans_endpoint_epsilon)
+    non_endpoint = (left_distance > eps) & (right_distance > eps)
+    candidate_cells = witness_cells
+    fallback_used = 0.0
+
+    if FLAGS.trans_witness_mode == "avoid_endpoints":
+        preferred = witness_cells[non_endpoint[witness_cells]]
+        if len(preferred) > 0:
+            candidate_cells = preferred
+        else:
+            fallback_used = 1.0
+    elif FLAGS.trans_witness_mode == "boundary_balanced":
+        beta = float(FLAGS.trans_boundary_beta)
+        boundary_mask = (
+            non_endpoint
+            & (left_distance >= beta * float(left_budget))
+            & (right_distance >= beta * float(right_budget))
+        )
+        preferred = witness_cells[boundary_mask[witness_cells]]
+        if len(preferred) > 0:
+            candidate_cells = preferred
+        else:
+            non_endpoint_cells = witness_cells[non_endpoint[witness_cells]]
+            if len(non_endpoint_cells) > 0:
+                candidate_cells = non_endpoint_cells
+            fallback_used = 1.0
+    elif FLAGS.trans_witness_mode == "slack_balanced":
+        non_endpoint_cells = witness_cells[non_endpoint[witness_cells]]
+        if len(non_endpoint_cells) > 0:
+            candidate_cells = non_endpoint_cells
+        else:
+            fallback_used = 1.0
+        left_slack = float(left_budget) - left_distance[candidate_cells]
+        right_slack = float(right_budget) - right_distance[candidate_cells]
+        scores = -np.abs(left_slack - right_slack)
+        order = np.argsort(scores)[::-1]
+        top_count = min(
+            len(candidate_cells),
+            max(int(num_witnesses), int(np.ceil(0.25 * len(candidate_cells)))),
+        )
+        candidate_cells = candidate_cells[order[:top_count]]
+    elif FLAGS.trans_witness_mode != "uniform_valid":
+        raise ValueError(f"Unsupported trans_witness_mode={FLAGS.trans_witness_mode}")
+
+    replace = len(candidate_cells) < int(num_witnesses)
+    sampled = rng.choice(candidate_cells, size=int(num_witnesses), replace=replace)
+    unique_count = len(np.unique(sampled))
+    return dict(
+        witness_cells=witness_cells,
+        candidate_cells=candidate_cells,
+        sampled_witness_cells=sampled,
+        effective_unique_witness_count=float(unique_count),
+        unique_witness_frac=float(unique_count / float(num_witnesses)),
+        replacement_used=float(replace),
+        fallback_used=float(fallback_used),
+    )
+
+
 def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size, rng):
     """Sample geodesic-valid state-only transitive tuples for BMM V_H."""
     if context["kind"] != "grid_geodesic":
@@ -327,7 +432,11 @@ def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size,
     left_slacks = []
     right_slacks = []
     witness_cell_counts = []
+    witness_candidate_counts = []
+    effective_unique_witness_counts = []
     unique_witness_fracs = []
+    replacement_used = []
+    witness_fallback_used = []
     trans_parent_oracle_labels = []
     trans_branch_oracle_valids = []
     num_witnesses = int(FLAGS.num_trans_witnesses)
@@ -367,14 +476,19 @@ def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size,
             & (src_distances <= float(left_budget))
             & (step_distances[:, goal_cell] <= float(right_budget))
         )
-        witness_cells = np.nonzero(witness_mask)[0]
-        if len(witness_cells) == 0:
-            continue
-
-        replace = len(witness_cells) < num_witnesses
-        sampled_witness_cells = rng.choice(
-            witness_cells, size=num_witnesses, replace=replace
+        selection = select_witness_cells(
+            witness_mask,
+            src_distances,
+            step_distances[:, goal_cell],
+            left_budget,
+            right_budget,
+            num_witnesses,
+            rng,
         )
+        if selection is None:
+            continue
+        witness_cells = selection["witness_cells"]
+        sampled_witness_cells = selection["sampled_witness_cells"]
         goal_idx = int(rng.choice(state_by_cell[goal_cell]))
         observations.append(np.asarray(dataset["observations"])[src_idx])
         actions.append(np.asarray(dataset["actions"])[src_idx])
@@ -384,9 +498,13 @@ def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size,
         value_offsets.append(parent_distance)
         parent_distances.append(parent_distance)
         witness_cell_counts.append(float(len(witness_cells)))
-        unique_witness_fracs.append(
-            float(len(np.unique(sampled_witness_cells)) / float(num_witnesses))
+        witness_candidate_counts.append(float(len(selection["candidate_cells"])))
+        effective_unique_witness_counts.append(
+            selection["effective_unique_witness_count"]
         )
+        unique_witness_fracs.append(selection["unique_witness_frac"])
+        replacement_used.append(selection["replacement_used"])
+        witness_fallback_used.append(selection["fallback_used"])
         trans_parent_oracle_labels.append(float(parent_distance <= float(budget)))
 
         parent_witness_observations = []
@@ -480,7 +598,15 @@ def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size,
             np.asarray(right_slacks, dtype=np.float32), 0, 1
         ),
         trans_witness_cell_counts=np.asarray(witness_cell_counts, dtype=np.float32),
+        trans_witness_candidate_counts=np.asarray(
+            witness_candidate_counts, dtype=np.float32
+        ),
+        trans_effective_unique_witness_counts=np.asarray(
+            effective_unique_witness_counts, dtype=np.float32
+        ),
         trans_unique_witness_fracs=np.asarray(unique_witness_fracs, dtype=np.float32),
+        trans_replacement_used=np.asarray(replacement_used, dtype=np.float32),
+        trans_witness_fallback_used=np.asarray(witness_fallback_used, dtype=np.float32),
         trans_parent_oracle_labels=np.asarray(
             trans_parent_oracle_labels, dtype=np.float32
         ),
@@ -555,8 +681,26 @@ def summarize_transitive_batch(trans_batch, budgets):
                 witness_cell_count_mean=finite_mean(
                     np.asarray(trans_batch["trans_witness_cell_counts"])[parent_mask]
                 ),
+                witness_candidate_count_mean=finite_mean(
+                    np.asarray(trans_batch["trans_witness_candidate_counts"])[
+                        parent_mask
+                    ]
+                ),
+                effective_unique_witness_count_mean=finite_mean(
+                    np.asarray(trans_batch["trans_effective_unique_witness_counts"])[
+                        parent_mask
+                    ]
+                ),
                 unique_witness_frac=finite_mean(
                     np.asarray(trans_batch["trans_unique_witness_fracs"])[parent_mask]
+                ),
+                replacement_used_frac=finite_mean(
+                    np.asarray(trans_batch["trans_replacement_used"])[parent_mask]
+                ),
+                witness_fallback_used_frac=finite_mean(
+                    np.asarray(trans_batch["trans_witness_fallback_used"])[
+                        parent_mask
+                    ]
                 ),
                 zero_left_frac=finite_mean(
                     (left_distances[witness_mask] <= 1e-6).astype(np.float32)
@@ -594,6 +738,7 @@ def summarize_transitive_batch(trans_batch, budgets):
             np.asarray(trans_batch["trans_attempts_per_sample"])
         ),
         num_trans_witnesses=int(np.asarray(trans_valids).shape[0]),
+        trans_witness_mode=str(FLAGS.trans_witness_mode),
         budget_rows=rows,
         histograms=histograms,
     )
@@ -634,6 +779,7 @@ def score_sup_batch(agent, batch, budgets):
         "ensemble_min": binary_metrics(min_scores[valids], labels[valids]),
         "budget_rows": [],
     }
+    ratio_bins = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, np.inf]
     for budget in budgets:
         mask = valids & (sup_budgets == int(budget))
         if not mask.any():
@@ -651,6 +797,21 @@ def score_sup_batch(agent, batch, budgets):
                 "baselines": {
                     "distance_oracle": rank_metrics(-row_distances, row_labels),
                     "euclidean": rank_metrics(-euclidean, row_labels),
+                },
+                "histograms": {
+                    "supervised_distance_over_H": coarse_hist(
+                        row_distances / float(max(int(budget), 1)), ratio_bins
+                    ),
+                    "supervised_positive_distance_over_H": coarse_hist(
+                        row_distances[row_labels == 1]
+                        / float(max(int(budget), 1)),
+                        ratio_bins,
+                    ),
+                    "supervised_negative_distance_over_H": coarse_hist(
+                        row_distances[row_labels == 0]
+                        / float(max(int(budget), 1)),
+                        ratio_bins,
+                    ),
                 },
             }
         )
@@ -748,15 +909,16 @@ def print_transitive_summary(summary, info):
         f"accept={format_metric(summary['trans_sample_acceptance_rate'])} | "
         f"attempts/sample={format_metric(summary['trans_attempts_per_sample'])} | "
         f"K={summary['num_trans_witnesses']} | "
+        f"mode={summary['trans_witness_mode']} | "
         f"loss_trans/sup={format_metric(ratio)}"
     )
     print(
         "H | parents | parent_d | left_d | right_d | left_slack | right_slack | "
-        "w_cells | uniq_w | zero_l | zero_r"
+        "w_cells | cand | eff_K | repl | uniq_w | zero_l | zero_r"
     )
     print(
         "--|---------|----------|--------|---------|------------|-------------|"
-        "---------|--------|--------|-------"
+        "---------|------|-------|------|--------|--------|-------"
     )
     for row in summary["budget_rows"]:
         print(
@@ -767,6 +929,9 @@ def print_transitive_summary(summary, info):
             f"{format_metric(row['left_slack_mean'])} | "
             f"{format_metric(row['right_slack_mean'])} | "
             f"{format_metric(row['witness_cell_count_mean'])} | "
+            f"{format_metric(row['witness_candidate_count_mean'])} | "
+            f"{format_metric(row['effective_unique_witness_count_mean'])} | "
+            f"{format_metric(row['replacement_used_frac'])} | "
             f"{format_metric(row['unique_witness_frac'])} | "
             f"{format_metric(row['zero_left_frac'])} | "
             f"{format_metric(row['zero_right_frac'])}"
@@ -803,6 +968,12 @@ def main(_):
     if config["agent_name"] != "bmm_trl":
         raise ValueError("train_bmm_geodesic_value.py requires bmm_trl.")
     budgets = parse_budgets(FLAGS.budgets)
+    sup_pairs_per_budget = positive_or_default(
+        FLAGS.sup_pairs_per_budget, FLAGS.batch_size, "sup_pairs_per_budget"
+    )
+    trans_pairs_per_update = positive_or_default(
+        FLAGS.trans_pairs_per_update, FLAGS.batch_size, "trans_pairs_per_update"
+    )
     configure_agent(config, budgets)
 
     xy_dims = parse_xy_dims(FLAGS.xy_dims)
@@ -817,6 +988,9 @@ def main(_):
     print(f"  budgets: {budgets}")
     print(f"  lambda_trans: {FLAGS.lambda_trans}")
     print(f"  num_trans_witnesses: {FLAGS.num_trans_witnesses}")
+    print(f"  trans_witness_mode: {FLAGS.trans_witness_mode}")
+    print(f"  sup_pairs_per_budget: {sup_pairs_per_budget}")
+    print(f"  trans_pairs_per_update: {trans_pairs_per_update}")
     print(f"  context: {context_metadata(context)}")
 
     dataset_class = {"GCDataset": GCDataset}[config["dataset"]["dataset_class"]]
@@ -842,7 +1016,10 @@ def main(_):
     last_transitive_summary = None
 
     for step in range(1, FLAGS.steps + 1):
-        train_batch = gc_train.sample(config.batch_size)
+        base_batch_size = (
+            trans_pairs_per_update if FLAGS.lambda_trans > 0.0 else FLAGS.batch_size
+        )
+        train_batch = gc_train.sample(base_batch_size)
         transitive_fields = None
         if FLAGS.lambda_trans > 0.0:
             transitive_fields = sample_grid_transitive_v_pairs(
@@ -850,7 +1027,7 @@ def main(_):
                 context,
                 "train",
                 budgets,
-                config.batch_size,
+                trans_pairs_per_update,
                 rng,
             )
             train_batch.update(transitive_fields)
@@ -860,7 +1037,7 @@ def main(_):
                 context,
                 "train",
                 budgets,
-                config.batch_size,
+                sup_pairs_per_budget,
                 rng,
             )
         )
@@ -898,6 +1075,8 @@ def main(_):
             reachability_label_type=FLAGS.reachability_label_type,
             budgets=[int(x) for x in budgets],
             batch_size=int(FLAGS.batch_size),
+            sup_pairs_per_budget=int(sup_pairs_per_budget),
+            trans_pairs_per_update=int(trans_pairs_per_update),
             eval_pairs=int(FLAGS.eval_pairs),
             steps=int(FLAGS.steps),
             eval_interval=int(FLAGS.eval_interval),
@@ -905,6 +1084,9 @@ def main(_):
             lambda_trans=float(FLAGS.lambda_trans),
             trans_pos_boundary_frac=float(FLAGS.trans_pos_boundary_frac),
             num_trans_witnesses=int(FLAGS.num_trans_witnesses),
+            trans_witness_mode=str(FLAGS.trans_witness_mode),
+            trans_endpoint_epsilon=float(FLAGS.trans_endpoint_epsilon),
+            trans_boundary_beta=float(FLAGS.trans_boundary_beta),
             context=context_metadata(context),
         ),
     )
