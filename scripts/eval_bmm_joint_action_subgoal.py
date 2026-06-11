@@ -2,6 +2,7 @@
 """Joint action-subgoal diagnostic for BMM Q/V critics."""
 
 import argparse
+import copy
 import json
 from pathlib import Path
 import sys
@@ -17,6 +18,15 @@ from envs.env_utils import make_env_and_datasets
 from scripts import eval_bmm_action_ranking as ar
 from scripts.bmm_reachability_utils import format_metric
 from utils.flax_utils import restore_agent
+
+
+SUPPORTED_CANDIDATE_ACTION_MODES = (
+    "same_cell_cached",
+    "neighbor_cell",
+    "directional",
+    "oracle_diverse",
+    "dataset_global_oracle",
+)
 
 
 def score_flat(agent, observations, actions, goals, budgets, batch_size):
@@ -36,6 +46,296 @@ def score_flat(agent, observations, actions, goals, budgets, batch_size):
         mean_scores.append(scores.mean(axis=0))
         min_scores.append(scores.min(axis=0))
     return np.concatenate(mean_scores), np.concatenate(min_scores)
+
+
+def unique_in_order(values):
+    seen = set()
+    kept = []
+    for value in np.asarray(values, dtype=np.int32).reshape(-1):
+        value = int(value)
+        if value not in seen:
+            kept.append(value)
+            seen.add(value)
+    return np.asarray(kept, dtype=np.int32)
+
+
+def fill_candidate_indices(chosen, pool, count, rng):
+    chosen = unique_in_order(chosen)
+    pool = unique_in_order(pool)
+    count = int(count)
+    if len(chosen) >= count:
+        return chosen[:count]
+    if len(pool) == 0:
+        if len(chosen) == 0:
+            raise ValueError("Cannot fill candidate actions from an empty pool.")
+        pool = chosen
+    remaining = count - len(chosen)
+    chosen_set = set(int(x) for x in chosen)
+    available = np.asarray([int(x) for x in pool if int(x) not in chosen_set], dtype=np.int32)
+    if len(available) == 0:
+        available = pool
+    extra = rng.choice(available, size=remaining, replace=len(available) < remaining)
+    return np.concatenate([chosen, np.asarray(extra, dtype=np.int32)])[:count]
+
+
+def select_diverse_by_distance(pool, distances, count, rng):
+    pool = unique_in_order(pool)
+    distances = np.asarray(distances, dtype=np.float32)
+    if len(pool) == 0:
+        return pool
+    order = np.argsort(distances)
+    ordered = pool[order]
+    if len(ordered) <= int(count):
+        return ordered
+    ranks = np.linspace(0, len(ordered) - 1, int(count))
+    selected = ordered[np.unique(np.round(ranks).astype(np.int32))]
+    return fill_candidate_indices(selected, ordered, count, rng)
+
+
+def local_transition_pool(by_cell, cells):
+    chunks = []
+    for cell in np.asarray(cells, dtype=np.int32).reshape(-1):
+        cell = int(cell)
+        if 0 <= cell < len(by_cell) and len(by_cell[cell]) > 0:
+            chunks.append(np.asarray(by_cell[cell], dtype=np.int32))
+    if not chunks:
+        return np.asarray([], dtype=np.int32)
+    return unique_in_order(np.concatenate(chunks))
+
+
+def finite_pool_to_goal(pool, state_to_cell, cell_distances_raw, step_distances, goal_cell):
+    pool = unique_in_order(pool)
+    if len(pool) == 0:
+        return pool, np.asarray([], dtype=np.float32)
+    next_cells = np.asarray(state_to_cell, dtype=np.int32)[pool + 1]
+    finite = (next_cells >= 0) & (cell_distances_raw[next_cells, int(goal_cell)] >= 0)
+    pool = pool[finite]
+    next_cells = next_cells[finite]
+    distances = step_distances[next_cells, int(goal_cell)].astype(np.float32)
+    return pool, distances
+
+
+def direction_key(delta):
+    row, col = int(delta[0]), int(delta[1])
+    return (
+        0 if row == 0 else int(np.sign(row)),
+        0 if col == 0 else int(np.sign(col)),
+    )
+
+
+def select_directional_candidates(
+    pool,
+    distances,
+    source_cell,
+    state_to_cell,
+    free_cells,
+    count,
+    rng,
+    preferred=(),
+):
+    pool = unique_in_order(pool)
+    distances = np.asarray(distances, dtype=np.float32)
+    if len(pool) == 0:
+        return fill_candidate_indices(preferred, pool, count, rng)
+    next_cells = np.asarray(state_to_cell, dtype=np.int32)[pool + 1]
+    groups = {}
+    source_xy = np.asarray(free_cells[int(source_cell)], dtype=np.int32)
+    for idx, transition_idx in enumerate(pool):
+        key = direction_key(np.asarray(free_cells[int(next_cells[idx])]) - source_xy)
+        current = groups.get(key)
+        if current is None or distances[idx] < current[1]:
+            groups[key] = (int(transition_idx), float(distances[idx]))
+    directional = np.asarray(
+        [value[0] for key, value in sorted(groups.items())], dtype=np.int32
+    )
+    chosen = fill_candidate_indices(preferred, directional, min(len(directional), count), rng)
+    if len(chosen) < int(count):
+        diverse = select_diverse_by_distance(pool, distances, count, rng)
+        chosen = fill_candidate_indices(chosen, diverse, count, rng)
+    return chosen[: int(count)]
+
+
+def resize_cached_candidates(queries, candidate_count, rng):
+    current_count = int(queries["actions"].shape[1])
+    candidate_count = int(candidate_count)
+    if current_count == candidate_count:
+        return queries
+    idx_rows = []
+    for row in np.asarray(queries["candidate_source_idxs"], dtype=np.int32):
+        if current_count > candidate_count:
+            idx_rows.append(row[:candidate_count])
+        else:
+            idx_rows.append(fill_candidate_indices(row, row, candidate_count, rng))
+    return replace_candidate_action_indices(
+        queries,
+        queries["_candidate_dataset"],
+        queries["_candidate_context"],
+        np.asarray(idx_rows, dtype=np.int32),
+    )
+
+
+def replace_candidate_action_indices(queries, dataset, context, candidate_idxs):
+    queries = copy.copy(queries)
+    candidate_idxs = np.asarray(candidate_idxs, dtype=np.int32)
+    state_to_cell = np.asarray(context["val_state_to_cell"], dtype=np.int32)
+    step_distances = np.asarray(context["cell_distances"], dtype=np.float32) * float(
+        context["distance_scale"]
+    )
+    goal_cells = np.asarray(queries["goal_cells"], dtype=np.int32)
+    next_cells = state_to_cell[candidate_idxs + 1]
+    distances = step_distances[next_cells, goal_cells[:, None]].astype(np.float32)
+    goals = np.repeat(
+        np.asarray(queries["goals"], dtype=np.float32)[:, :1, :],
+        candidate_idxs.shape[1],
+        axis=1,
+    )
+    observations = np.repeat(
+        np.asarray(queries["observations"], dtype=np.float32)[:, :1, :],
+        candidate_idxs.shape[1],
+        axis=1,
+    )
+    queries["observations"] = observations
+    queries["candidate_observations"] = np.asarray(dataset["observations"])[
+        candidate_idxs
+    ].astype(np.float32)
+    queries["actions"] = np.asarray(dataset["actions"])[candidate_idxs].astype(
+        np.float32
+    )
+    queries["next_observations"] = np.asarray(dataset["observations"])[
+        candidate_idxs + 1
+    ].astype(np.float32)
+    queries["goals"] = goals
+    queries["candidate_source_idxs"] = candidate_idxs
+    queries["candidate_next_cells"] = next_cells.astype(np.int32)
+    queries["distances"] = distances
+    queries["labels"] = (
+        distances <= float(queries.get("remaining_budget", queries["budget"] - 1))
+    ).astype(np.float32)
+    return queries
+
+
+def apply_candidate_action_mode(
+    queries,
+    dataset,
+    context,
+    mode,
+    candidate_count,
+    neighbor_hops,
+    rng,
+):
+    if mode not in SUPPORTED_CANDIDATE_ACTION_MODES:
+        raise ValueError(
+            f"Unsupported candidate action mode {mode!r}. "
+            f"Expected one of {SUPPORTED_CANDIDATE_ACTION_MODES}."
+        )
+
+    queries = ar.hydrate_query_candidate_fields(queries, dataset, context, split="val")
+    queries = copy.copy(queries)
+    queries["_candidate_dataset"] = dataset
+    queries["_candidate_context"] = context
+    candidate_count = int(candidate_count)
+
+    if mode == "same_cell_cached":
+        result = resize_cached_candidates(queries, candidate_count, rng)
+        result.pop("_candidate_dataset", None)
+        result.pop("_candidate_context", None)
+        return result
+
+    state_to_cell = np.asarray(context["val_state_to_cell"], dtype=np.int32)
+    cell_distances_raw = np.asarray(context["cell_distances"], dtype=np.int32)
+    step_distances = cell_distances_raw.astype(np.float32) * float(
+        context["distance_scale"]
+    )
+    by_cell = ar.transition_indices_by_cell(dataset, state_to_cell)
+    all_pool = local_transition_pool(by_cell, np.arange(len(by_cell), dtype=np.int32))
+    free_cells = np.asarray(context["free_cells"], dtype=np.int32)
+
+    candidate_rows = []
+    for row, (source_cell, goal_cell) in enumerate(
+        zip(np.asarray(queries["source_cells"], dtype=np.int32), np.asarray(queries["goal_cells"], dtype=np.int32))
+    ):
+        source_cell = int(source_cell)
+        goal_cell = int(goal_cell)
+        cached_row = np.asarray(queries["candidate_source_idxs"][row], dtype=np.int32)
+        logged = np.asarray([int(cached_row[0])], dtype=np.int32)
+
+        if mode in ("neighbor_cell", "directional"):
+            neighbor_cells = np.nonzero(
+                (cell_distances_raw[source_cell] >= 0)
+                & (cell_distances_raw[source_cell] <= int(neighbor_hops))
+            )[0]
+            pool = local_transition_pool(by_cell, neighbor_cells)
+            preferred = logged
+        else:
+            pool = all_pool
+            preferred = np.asarray([], dtype=np.int32)
+
+        finite_pool, distances = finite_pool_to_goal(
+            pool, state_to_cell, cell_distances_raw, step_distances, goal_cell
+        )
+        if len(finite_pool) == 0:
+            finite_pool = cached_row
+            distances = np.asarray(queries["distances"][row], dtype=np.float32)
+
+        if mode == "directional":
+            selected = select_directional_candidates(
+                finite_pool,
+                distances,
+                source_cell,
+                state_to_cell,
+                free_cells,
+                candidate_count,
+                rng,
+                preferred=preferred,
+            )
+        elif mode == "dataset_global_oracle":
+            selected = finite_pool[np.argsort(distances)[:candidate_count]]
+            selected = fill_candidate_indices(selected, finite_pool, candidate_count, rng)
+        else:
+            selected = select_diverse_by_distance(
+                finite_pool, distances, candidate_count, rng
+            )
+            selected = fill_candidate_indices(preferred, selected, candidate_count, rng)
+        candidate_rows.append(selected.astype(np.int32))
+
+    result = replace_candidate_action_indices(
+        queries,
+        dataset,
+        context,
+        np.asarray(candidate_rows, dtype=np.int32),
+    )
+    result.pop("_candidate_dataset", None)
+    result.pop("_candidate_context", None)
+    return result
+
+
+def candidate_action_diagnostics(queries, xy_dims=(0, 1)):
+    distances = np.asarray(queries["distances"], dtype=np.float32)
+    candidate_next_cells = np.asarray(queries["candidate_next_cells"], dtype=np.int32)
+    diag = dict(
+        oracle_best_selected_distance_mean=float(distances.min(axis=1).mean()),
+        logged_selected_distance_mean=float(distances[:, 0].mean()),
+        random_selected_distance_mean=float(distances.mean()),
+        next_distance_spread_mean=float(
+            (distances.max(axis=1) - distances.min(axis=1)).mean()
+        ),
+        unique_next_cell_count_mean=float(
+            np.asarray(
+                [len(np.unique(row)) for row in candidate_next_cells],
+                dtype=np.float32,
+            ).mean()
+        ),
+    )
+    if "candidate_observations" in queries:
+        xy = np.asarray(queries["candidate_observations"], dtype=np.float32)[
+            ..., tuple(xy_dims)
+        ]
+        deltas = xy[:, :, None, :] - xy[:, None, :, :]
+        pairwise = np.linalg.norm(deltas, axis=-1)
+        diag["source_position_spread_mean"] = float(pairwise.max(axis=(1, 2)).mean())
+    else:
+        diag["source_position_spread_mean"] = float("nan")
+    return diag
 
 
 def sample_joint_candidates(
@@ -314,25 +614,67 @@ def oracle_baselines(batch, rng):
     }
 
 
+def joint_candidate_coverage(batch, action_diag):
+    action_left_budget = max(float(batch["left_budget"]) - 1.0, 1.0)
+    action_error = np.abs(batch["next_distances"] - action_left_budget) + np.abs(
+        batch["right_distances"][:, None, :] - float(batch["right_budget"])
+    )
+    state_error = np.abs(batch["source_distances"] - float(batch["left_budget"])) + np.abs(
+        batch["right_distances"] - float(batch["right_budget"])
+    )
+    valid_action_error = np.where(batch["action_valids"] > 0.0, action_error, np.inf)
+    has_valid_action = np.isfinite(valid_action_error).any(axis=(1, 2))
+    valid_state_error = np.where(batch["state_valids"] > 0.0, state_error, np.inf)
+    has_valid_state = np.isfinite(valid_state_error).any(axis=1)
+
+    coverage = dict(action_diag)
+    coverage.update(
+        oracle_any_action_valid_frac=float(batch["action_valids"].any(axis=(1, 2)).mean()),
+        oracle_any_state_valid_frac=float(batch["state_valids"].any(axis=1).mean()),
+        oracle_action_valid_pair_frac=float(batch["action_valids"].mean()),
+        oracle_state_valid_subgoal_frac=float(batch["state_valids"].mean()),
+        oracle_best_action_midpoint_error=float(action_error.min(axis=(1, 2)).mean()),
+        oracle_best_state_midpoint_error=float(state_error.min(axis=1).mean()),
+        oracle_best_valid_action_midpoint_error=float(
+            valid_action_error[has_valid_action].min(axis=(1, 2)).mean()
+        )
+        if has_valid_action.any()
+        else float("nan"),
+        oracle_best_valid_state_midpoint_error=float(
+            valid_state_error[has_valid_state].min(axis=1).mean()
+        )
+        if has_valid_state.any()
+        else float("nan"),
+    )
+    return coverage
+
+
 def markdown(result):
     lines = [
         "# BMM joint action-subgoal diagnostic",
         "",
         f"env: `{result['env_name']}`",
         f"budget: `{result['budget']}` split `{result['left_budget']}/{result['right_budget']}`",
+        f"candidate action mode: `{result['candidate_action_mode']}`",
         f"queries: `{result['num_queries']}`, actions/query: `{result['candidate_action_count']}`, subgoals/query: `{result['num_subgoals']}`",
         f"query cache: `{result['query_cache_path']}`",
         "",
         "## Candidate Set",
         "",
-        f"oracle any action-valid fraction: `{format_metric(result['candidate_set']['oracle_any_action_valid_frac'])}`",
-        f"oracle any state-valid fraction: `{format_metric(result['candidate_set']['oracle_any_state_valid_frac'])}`",
-        "",
-        "## Scores",
-        "",
-        "| scorer | score | state_valid | action_valid | source_d | next_d | right_d | source_stretch | next_stretch | midpoint_err | action_mid_err | unique_subgoals | unique_actions | nonlogged_action |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| metric | value |",
+        "|---|---:|",
     ]
+    for key, value in result["candidate_set"].items():
+        lines.append(f"| {key} | {format_metric(value)} |")
+    lines.extend(
+        [
+            "",
+            "## Scores",
+            "",
+            "| scorer | score | state_valid | action_valid | source_d | next_d | right_d | source_stretch | next_stretch | midpoint_err | action_mid_err | unique_subgoals | unique_actions | nonlogged_action |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
     for row in result["rows"]:
         m = row["metrics"]
         lines.append(
@@ -370,10 +712,18 @@ def main(argv=None):
     parser.add_argument("--query_cache_path", required=True)
     parser.add_argument("--num_queries", type=int, default=128)
     parser.add_argument("--num_subgoals", type=int, default=64)
+    parser.add_argument("--candidate_count", type=int, default=8)
+    parser.add_argument(
+        "--candidate_action_mode",
+        default="same_cell_cached",
+        choices=SUPPORTED_CANDIDATE_ACTION_MODES,
+    )
+    parser.add_argument("--neighbor_hops", type=int, default=2)
+    parser.add_argument("--coverage_only", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--critics", nargs="+", required=True)
-    parser.add_argument("--value_restore_path", required=True)
-    parser.add_argument("--value_restore_epoch", type=int, required=True)
+    parser.add_argument("--critics", nargs="*", default=[])
+    parser.add_argument("--value_restore_path", default=None)
+    parser.add_argument("--value_restore_epoch", type=int, default=None)
     parser.add_argument("--actor_hidden_dims", default="(256, 256)")
     parser.add_argument("--value_hidden_dims", default="(256, 256)")
     parser.add_argument("--layer_norm", default="False")
@@ -401,6 +751,18 @@ def main(argv=None):
         for key in ar.QUERY_CACHE_KEYS:
             if key in queries:
                 queries[key] = queries[key][: args.num_queries]
+    queries = apply_candidate_action_mode(
+        queries,
+        val_dataset,
+        context,
+        args.candidate_action_mode,
+        args.candidate_count,
+        args.neighbor_hops,
+        rng,
+    )
+    action_diag = candidate_action_diagnostics(
+        queries, xy_dims=ar.parse_xy_dims(args.xy_dims)
+    )
     batch = sample_joint_candidates(
         val_dataset,
         context,
@@ -409,13 +771,6 @@ def main(argv=None):
         args.right_budget,
         args.num_subgoals,
         rng,
-    )
-
-    value_agent = ar.configure_restore_agent(
-        args, train_dataset, budgets, critic_mode="state"
-    )
-    value_agent = restore_agent(
-        value_agent, args.value_restore_path, args.value_restore_epoch
     )
 
     rows = []
@@ -427,38 +782,54 @@ def main(argv=None):
                 metrics=selection_metrics(scores, batch),
             )
         )
-    vv_scores = score_vv_joint(value_agent, batch, args.score_batch_size)
-    for score_name, scores in vv_scores.items():
-        rows.append(
-            dict(
-                name="V/V_teacher",
-                score=score_name,
-                metrics=selection_metrics(scores, batch),
-            )
-        )
 
-    for spec in args.critics:
-        name, restore_path, restore_epoch = ar.parse_critic_spec(spec)
-        agent = ar.configure_restore_agent(
-            args, train_dataset, budgets, critic_mode="action"
-        )
-        agent = restore_agent(agent, restore_path, restore_epoch)
-        for q_state_mode in ("source_state", "own_state"):
-            scores_by_name = score_qv_joint(
-                agent,
-                value_agent,
-                batch,
-                q_state_mode,
-                args.score_batch_size,
+    if not args.coverage_only:
+        if args.value_restore_path is None or args.value_restore_epoch is None:
+            raise ValueError(
+                "--value_restore_path and --value_restore_epoch are required unless "
+                "--coverage_only is set."
             )
-            for score_name, scores in scores_by_name.items():
-                rows.append(
-                    dict(
-                        name=f"{name}_Q/V_{q_state_mode}",
-                        score=score_name,
-                        metrics=selection_metrics(scores, batch),
-                    )
+        if not args.critics:
+            raise ValueError("--critics is required unless --coverage_only is set.")
+
+        value_agent = ar.configure_restore_agent(
+            args, train_dataset, budgets, critic_mode="state"
+        )
+        value_agent = restore_agent(
+            value_agent, args.value_restore_path, args.value_restore_epoch
+        )
+        vv_scores = score_vv_joint(value_agent, batch, args.score_batch_size)
+        for score_name, scores in vv_scores.items():
+            rows.append(
+                dict(
+                    name="V/V_teacher",
+                    score=score_name,
+                    metrics=selection_metrics(scores, batch),
                 )
+            )
+
+        for spec in args.critics:
+            name, restore_path, restore_epoch = ar.parse_critic_spec(spec)
+            agent = ar.configure_restore_agent(
+                args, train_dataset, budgets, critic_mode="action"
+            )
+            agent = restore_agent(agent, restore_path, restore_epoch)
+            for q_state_mode in ("source_state", "own_state"):
+                scores_by_name = score_qv_joint(
+                    agent,
+                    value_agent,
+                    batch,
+                    q_state_mode,
+                    args.score_batch_size,
+                )
+                for score_name, scores in scores_by_name.items():
+                    rows.append(
+                        dict(
+                            name=f"{name}_Q/V_{q_state_mode}",
+                            score=score_name,
+                            metrics=selection_metrics(scores, batch),
+                        )
+                    )
 
     result = dict(
         env_name=args.env_name,
@@ -466,16 +837,18 @@ def main(argv=None):
         budget=int(args.budget),
         left_budget=int(args.left_budget),
         right_budget=int(args.right_budget),
+        candidate_action_mode=args.candidate_action_mode,
+        neighbor_hops=int(args.neighbor_hops),
+        coverage_only=bool(args.coverage_only),
         num_queries=int(batch["source_observations"].shape[0]),
         candidate_action_count=int(batch["candidate_action_count"]),
         num_subgoals=int(batch["num_subgoals"]),
         query_cache_path=args.query_cache_path,
         value_restore_path=args.value_restore_path,
-        value_restore_epoch=int(args.value_restore_epoch),
-        candidate_set=dict(
-            oracle_any_action_valid_frac=float(batch["oracle_any_action_valid_frac"]),
-            oracle_any_state_valid_frac=float(batch["oracle_any_state_valid_frac"]),
-        ),
+        value_restore_epoch=None
+        if args.value_restore_epoch is None
+        else int(args.value_restore_epoch),
+        candidate_set=joint_candidate_coverage(batch, action_diag),
         rows=rows,
     )
     text = markdown(result)

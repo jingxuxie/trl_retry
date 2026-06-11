@@ -79,6 +79,19 @@ def main():
     random_metrics = joint.selection_metrics(np.zeros((2, 2, 3)), batch)
     assert np.isclose(random_metrics["state_valid_frac"], 0.5)
 
+    coverage = joint.joint_candidate_coverage(
+        batch,
+        {
+            "oracle_best_selected_distance_mean": 1.0,
+            "next_distance_spread_mean": 2.0,
+            "unique_next_cell_count_mean": 2.0,
+        },
+    )
+    assert np.isclose(coverage["oracle_any_action_valid_frac"], 1.0)
+    assert np.isclose(coverage["oracle_any_state_valid_frac"], 1.0)
+    assert coverage["oracle_best_action_midpoint_error"] >= 0.0
+    assert "next_distance_spread_mean" in coverage
+
     print("BMM joint action-subgoal diagnostic checks passed.")
 
 
