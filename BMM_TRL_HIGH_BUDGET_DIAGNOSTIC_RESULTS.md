@@ -158,19 +158,96 @@ The strongest current evidence is:
 2. PointMaze fixed-batch overfit succeeds through `H=512`.
 3. PointMaze heldout state-only fails at `H=256/512`.
 4. Euclidean and action-goal baselines are near chance at `H=256/512`.
+5. kNN label-ambiguity analysis is also near chance at `H=256/512`.
 
 The likely issue is that high-budget same-trajectory offset in PointMaze is not
 a clean heldout function of the vector inputs. It may encode behavior-policy
 detours, maze topology, phase/history, or alternate shorter paths that are not
 captured by `(s, g, H)` or `(s, a, g, H)`.
 
+## kNN Label-Ambiguity Analysis
+
+After `BMM_TRL_NEXT_STEPS_AFTER_DIAGNOSTICS.md`, I added:
+
+```text
+scripts/analyze_bmm_label_ambiguity.py
+```
+
+This script samples balanced logged-offset pairs and asks whether a kNN
+classifier can predict `label = 1[offset <= H]` from several feature spaces:
+
+```text
+xy_pair          = [x_s, y_s, x_g, y_g]
+xy_delta         = [x_s, y_s, x_g, y_g, x_g - x_s, y_g - y_s]
+full_pair        = [obs_s, obs_g]
+full_pair_action = [obs_s, action_s, obs_g]
+```
+
+First run:
+
+```bash
+conda run -n bmm-trl python scripts/analyze_bmm_label_ambiguity.py \
+    --env_name=pointmaze-medium-navigate-v0 \
+    --budgets=64,128,256,512 \
+    --num_train_pairs=8192 \
+    --num_eval_pairs=2048 \
+    --k=32 \
+    --features=xy_pair,xy_delta,full_pair,full_pair_action \
+    --output_json=exp/bmm_label_ambiguity_8k_2k.json
+```
+
+Selected results:
+
+| H | feature | kNN AUC | gap | mean entropy | contradiction 25-75 |
+|---:|---|---:|---:|---:|---:|
+| 64 | xy_delta | 0.8381 | 0.3228 | 0.5147 | 0.6055 |
+| 128 | full_pair_action | 0.7137 | 0.1343 | 0.6237 | 0.8574 |
+| 256 | xy_pair | 0.5220 | 0.0059 | 0.6715 | 0.9883 |
+| 256 | full_pair_action | 0.5031 | 0.0006 | 0.6729 | 0.9956 |
+| 512 | xy_delta | 0.5173 | 0.0060 | 0.6739 | 0.9956 |
+| 512 | full_pair_action | 0.4977 | -0.0016 | 0.6763 | 0.9990 |
+
+Larger high-budget run:
+
+```bash
+conda run -n bmm-trl python scripts/analyze_bmm_label_ambiguity.py \
+    --env_name=pointmaze-medium-navigate-v0 \
+    --budgets=256,512 \
+    --num_train_pairs=32768 \
+    --num_eval_pairs=8192 \
+    --k=32 \
+    --features=xy_pair,xy_delta,full_pair,full_pair_action \
+    --output_json=exp/bmm_label_ambiguity_high_budget_32k_8k.json
+```
+
+High-budget confirmation:
+
+| H | feature | kNN AUC | gap | mean entropy | contradiction 25-75 |
+|---:|---|---:|---:|---:|---:|
+| 256 | xy_pair | 0.5316 | 0.0119 | 0.6689 | 0.9857 |
+| 256 | xy_delta | 0.5363 | 0.0135 | 0.6691 | 0.9873 |
+| 256 | full_pair | 0.5316 | 0.0119 | 0.6689 | 0.9857 |
+| 256 | full_pair_action | 0.5420 | 0.0166 | 0.6701 | 0.9868 |
+| 512 | xy_pair | 0.5125 | 0.0037 | 0.6746 | 0.9950 |
+| 512 | xy_delta | 0.5150 | 0.0051 | 0.6743 | 0.9957 |
+| 512 | full_pair | 0.5125 | 0.0037 | 0.6746 | 0.9950 |
+| 512 | full_pair_action | 0.5027 | 0.0006 | 0.6757 | 0.9969 |
+
+Interpretation: even a local non-parametric classifier cannot recover the
+high-budget logged-offset label from the same feature families available to the
+critic. This strengthens the conclusion that `offset <= H` should be treated as
+a behavior-time diagnostic, not as the main high-budget reachability verifier.
+Near-duplicate counts at the default raw xy radius were low, so the main signal
+is high local entropy/ambiguous neighbor labels rather than many exact duplicate
+contradictions.
+
 ## Recommended Next Diagnostics
 
-- Add a position-only diagnostic if the observation layout is reliable.
 - Add a geodesic or graph-distance proxy diagnostic for PointMaze.
-- Measure label ambiguity directly by finding nearby `(s, g)` pairs with
-  conflicting high-budget labels.
 - Try a small train/eval split from the same frozen balanced pair pool to
-  separate memorization from generalization.
+  separate local interpolation from trajectory/validation split generalization.
+- Add a position-only diagnostic if the observation layout is reliable, but the
+  kNN results already show that raw xy features alone are not enough at
+  `H=256/512`.
 - Keep ranking disabled until the sampler is vectorized; it is not needed to
   explain the current high-budget heldout failure.
