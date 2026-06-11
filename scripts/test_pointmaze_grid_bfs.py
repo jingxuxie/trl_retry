@@ -17,6 +17,7 @@ from utils.pointmaze_grid import (
     grid_distance_statistics,
     ij_to_xy,
     sample_grid_budget_pairs,
+    sample_grid_budget_q_pairs,
     state_to_free_cell_indices,
     xy_pair_grid_distances,
 )
@@ -79,6 +80,29 @@ def main():
     assert (pair_batch["labels"] == 0).sum() > 0
     assert np.all(pair_batch["grid_distances"][pair_batch["labels"] == 1] <= 2)
     assert np.all(pair_batch["grid_distances"][pair_batch["labels"] == 0] > 2)
+
+    q_pair_batch = sample_grid_budget_q_pairs(
+        dataset,
+        state_to_cell,
+        goal_by_cell,
+        cell_distances,
+        steps_per_cell=1.0,
+        budget=3,
+        num_pairs=64,
+        rng=np.random.default_rng(1),
+    )
+    assert q_pair_batch is not None
+    assert q_pair_batch["observations"].shape == q_pair_batch["goals"].shape
+    assert q_pair_batch["actions"].shape[0] == len(q_pair_batch["labels"])
+    assert np.all(q_pair_batch["source_idxs"] + 1 < len(observations))
+    assert np.allclose(
+        q_pair_batch["next_observations"],
+        observations[q_pair_batch["source_idxs"] + 1],
+    )
+    assert np.all(q_pair_batch["grid_distances"][q_pair_batch["labels"] == 1] <= 2)
+    assert np.all(q_pair_batch["grid_distances"][q_pair_batch["labels"] == 0] > 2)
+    assert q_pair_batch["labels"].sum() > 0
+    assert (q_pair_batch["labels"] == 0).sum() > 0
 
     print("PointMaze grid BFS checks passed.")
 

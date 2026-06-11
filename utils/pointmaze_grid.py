@@ -4,7 +4,7 @@ from collections import deque
 
 import numpy as np
 
-from utils.pointmaze_graph import dataset_xy, source_indices
+from utils.pointmaze_graph import dataset_xy, source_indices, valid_transition_indices
 
 
 def unwrap_maze_env(env):
@@ -236,6 +236,122 @@ def sample_grid_budget_pairs(
         grid_distances=np.asarray(grid_distances, dtype=np.float32),
         source_cells=np.asarray(source_cells, dtype=np.int32),
         goal_cells=np.asarray(goal_cells, dtype=np.int32),
+    )
+
+
+def sample_grid_budget_q_pairs(
+    dataset,
+    state_to_cell,
+    goal_by_cell,
+    cell_distances,
+    steps_per_cell,
+    budget,
+    num_pairs,
+    rng,
+    pos_boundary_frac=0.5,
+    neg_max_factor=2.0,
+    source_idxs=None,
+):
+    """Sample balanced geodesic Q pairs labeled from the next state.
+
+    The returned observations/actions are from ``s_t, a_t``. Distances and
+    labels are computed from ``s_{t+1}`` to the sampled goal:
+
+        Q_H(s_t, a_t, g) = 1[d_grid(s_{t+1}, g) <= H - 1].
+    """
+    budget = int(budget)
+    rng = np.random.default_rng() if rng is None else rng
+    state_to_cell = np.asarray(state_to_cell, dtype=np.int32)
+    if source_idxs is None:
+        src_idxs = valid_transition_indices(dataset)
+    else:
+        src_idxs = np.asarray(source_idxs, dtype=np.int32)
+    src_idxs = src_idxs[src_idxs + 1 < len(state_to_cell)]
+    src_idxs = src_idxs[
+        (state_to_cell[src_idxs] >= 0) & (state_to_cell[src_idxs + 1] >= 0)
+    ]
+    has_goal = np.asarray([len(items) > 0 for items in goal_by_cell])
+    step_distances = np.asarray(cell_distances, dtype=np.float32) * float(
+        steps_per_cell
+    )
+    remaining_budget = max(float(budget - 1), 1.0)
+
+    observations = []
+    actions = []
+    next_observations = []
+    goals = []
+    budgets = []
+    remaining_budgets = []
+    labels = []
+    grid_distances = []
+    source_cells = []
+    next_cells = []
+    goal_cells = []
+    source_idxs_out = []
+
+    def add_pairs(target_label, target_count):
+        attempts = 0
+        max_attempts = max(1000, int(target_count) * 100)
+        while target_count > 0 and attempts < max_attempts:
+            attempts += 1
+            src_idx = int(rng.choice(src_idxs))
+            src_cell = int(state_to_cell[src_idx])
+            next_cell = int(state_to_cell[src_idx + 1])
+            distances = step_distances[next_cell]
+            finite = (cell_distances[next_cell] >= 0) & has_goal
+            if target_label == 1.0:
+                lo = max(0.0, float(pos_boundary_frac) * remaining_budget)
+                hi = remaining_budget
+                candidate_mask = finite & (distances >= lo) & (distances <= hi)
+                if not candidate_mask.any() and lo > 0.0:
+                    candidate_mask = finite & (distances <= hi)
+            else:
+                lo = np.nextafter(remaining_budget, np.inf)
+                hi = float(neg_max_factor) * remaining_budget
+                candidate_mask = finite & (distances >= lo) & (distances <= hi)
+                if not candidate_mask.any():
+                    candidate_mask = finite & (distances > remaining_budget)
+
+            candidate_cells = np.nonzero(candidate_mask)[0]
+            if len(candidate_cells) == 0:
+                continue
+            goal_cell = int(rng.choice(candidate_cells))
+            goal_idx = int(rng.choice(goal_by_cell[goal_cell]))
+            distance = float(distances[goal_cell])
+            observations.append(np.asarray(dataset["observations"])[src_idx])
+            actions.append(np.asarray(dataset["actions"])[src_idx])
+            next_observations.append(np.asarray(dataset["observations"])[src_idx + 1])
+            goals.append(np.asarray(dataset["observations"])[goal_idx])
+            budgets.append(budget)
+            remaining_budgets.append(remaining_budget)
+            labels.append(float(distance <= remaining_budget))
+            grid_distances.append(distance)
+            source_cells.append(src_cell)
+            next_cells.append(next_cell)
+            goal_cells.append(goal_cell)
+            source_idxs_out.append(src_idx)
+            target_count -= 1
+
+    num_pos = int(num_pairs) // 2
+    num_neg = int(num_pairs) - num_pos
+    add_pairs(1.0, num_pos)
+    add_pairs(0.0, num_neg)
+
+    if len(labels) == 0:
+        return None
+    return dict(
+        observations=np.asarray(observations, dtype=np.float32),
+        actions=np.asarray(actions, dtype=np.float32),
+        next_observations=np.asarray(next_observations, dtype=np.float32),
+        goals=np.asarray(goals, dtype=np.float32),
+        budgets=np.asarray(budgets, dtype=np.int32),
+        remaining_budgets=np.asarray(remaining_budgets, dtype=np.float32),
+        labels=np.asarray(labels, dtype=np.float32),
+        grid_distances=np.asarray(grid_distances, dtype=np.float32),
+        source_cells=np.asarray(source_cells, dtype=np.int32),
+        next_cells=np.asarray(next_cells, dtype=np.int32),
+        goal_cells=np.asarray(goal_cells, dtype=np.int32),
+        source_idxs=np.asarray(source_idxs_out, dtype=np.int32),
     )
 
 
