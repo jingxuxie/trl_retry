@@ -34,8 +34,10 @@ def make_line_context(num_cells=12):
     goal_by_cell = [np.asarray([idx], dtype=np.int32) for idx in cells]
     context = dict(
         kind="grid_geodesic",
+        geodesic_budget_unit="grid_cells",
         cell_distances=cell_distances,
         steps_per_cell=1.0,
+        label_distance_scale=1.0,
         train_state_to_cell=state_to_cell,
         train_goal_by_cell=goal_by_cell,
     )

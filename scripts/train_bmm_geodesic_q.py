@@ -9,6 +9,7 @@ import random
 import sys
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from absl import app, flags
 from ml_collections import config_flags
@@ -18,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from agents import agents
+from agents.bmm_trl import masked_mean
 from envs.env_utils import make_env_and_datasets
 from scripts.bmm_reachability_utils import binary_metrics, format_metric, rank_metrics
 from utils.datasets import Dataset, GCDataset
@@ -58,9 +60,30 @@ flags.DEFINE_string(
 flags.DEFINE_string("graph_path", "exp/bmm_pointmaze_graph.npz", "Graph npz path.")
 flags.DEFINE_bool("rebuild_graph", False, "Rebuild graph labels even if graph exists.")
 flags.DEFINE_string("xy_dims", "0,1", "Comma-separated observation dims to use as xy.")
+flags.DEFINE_enum(
+    "geodesic_budget_unit",
+    "env_steps",
+    ["env_steps", "grid_cells"],
+    "Budget units for grid_geodesic labels.",
+)
 flags.DEFINE_integer("seed", 0, "Random seed.")
 flags.DEFINE_string("budgets", "(32, 64, 96, 128)", "Budgets to train/evaluate.")
+flags.DEFINE_string(
+    "trans_budgets",
+    None,
+    "Optional budgets for Q/V transitive parents; defaults to --budgets.",
+)
 flags.DEFINE_integer("batch_size", 256, "Training pairs per budget per update.")
+flags.DEFINE_integer(
+    "sup_pairs_per_budget",
+    0,
+    "Direct supervised Q pairs per budget per update; <=0 uses --batch_size.",
+)
+flags.DEFINE_integer(
+    "trans_pairs_per_update",
+    0,
+    "Q/V transitive parent tuples per update; <=0 uses --batch_size.",
+)
 flags.DEFINE_integer("eval_pairs", 512, "Heldout pairs per budget.")
 flags.DEFINE_integer("steps", 2000, "Training updates.")
 flags.DEFINE_integer("eval_interval", 250, "Evaluate every N updates.")
@@ -78,6 +101,37 @@ flags.DEFINE_float("target_auc", 0.90, "Default passing AUC threshold.")
 flags.DEFINE_float("target_gap", 0.20, "Default passing score-gap threshold.")
 flags.DEFINE_float("target_auc_128", 0.85, "Passing AUC threshold for H>=128.")
 flags.DEFINE_float("target_gap_128", 0.15, "Passing score-gap threshold for H>=128.")
+flags.DEFINE_float(
+    "lambda_qv_trans",
+    0.0,
+    "Q/V max-min transitive loss weight using a frozen state-value teacher.",
+)
+flags.DEFINE_float(
+    "trans_pos_boundary_frac",
+    0.5,
+    "Q/V transitive parent lower distance bound as a fraction of budget.",
+)
+flags.DEFINE_integer(
+    "num_trans_witnesses",
+    1,
+    "Number of witnesses per Q/V transitive parent.",
+)
+flags.DEFINE_enum(
+    "trans_witness_mode",
+    "avoid_endpoints",
+    ["uniform_valid", "avoid_endpoints", "slack_balanced", "boundary_balanced"],
+    "How to choose valid Q/V transitive witnesses.",
+)
+flags.DEFINE_float(
+    "trans_endpoint_epsilon",
+    1e-6,
+    "Distance threshold below which a transitive witness is treated as an endpoint.",
+)
+flags.DEFINE_float(
+    "trans_boundary_beta",
+    0.25,
+    "Minimum branch-distance fraction for boundary_balanced witness sampling.",
+)
 flags.DEFINE_string(
     "value_restore_path",
     None,
@@ -106,6 +160,13 @@ def parse_budgets(value):
     if not budgets:
         raise ValueError("--budgets must contain at least one budget.")
     return budgets
+
+
+def positive_or_default(value, default):
+    value = int(value)
+    if value <= 0:
+        return int(default)
+    return value
 
 
 def dataset_path_from_dir(dataset_dir):
@@ -145,6 +206,9 @@ def make_grid_context(env, train_dataset, val_dataset, xy_dims):
     maze_env = unwrap_maze_env(env)
     median_step = median_step_xy((train_dataset, val_dataset), xy_dims)
     steps_per_cell = float(maze_env._maze_unit) / median_step
+    label_distance_scale = (
+        1.0 if FLAGS.geodesic_budget_unit == "grid_cells" else steps_per_cell
+    )
     free_cells, cell_distances = free_cell_distance_matrix(maze_env.maze_map)
     train_state_to_cell = state_to_free_cell_indices(
         train_dataset,
@@ -168,13 +232,15 @@ def make_grid_context(env, train_dataset, val_dataset, xy_dims):
         train_state_to_cell, len(free_cells)
     )
     val_goal_by_cell = free_cell_to_state_indices(val_state_to_cell, len(free_cells))
-    stats = grid_distance_statistics(cell_distances, steps_per_cell)
+    stats = grid_distance_statistics(cell_distances, label_distance_scale)
     return dict(
         kind="grid_geodesic",
+        geodesic_budget_unit=str(FLAGS.geodesic_budget_unit),
         maze_type=maze_env._maze_type,
         maze_unit=float(maze_env._maze_unit),
         median_step_xy=float(median_step),
         steps_per_cell=float(steps_per_cell),
+        label_distance_scale=float(label_distance_scale),
         free_cells=free_cells,
         cell_distances=cell_distances,
         train_state_to_cell=train_state_to_cell,
@@ -347,7 +413,7 @@ def sample_context_budget_pairs(dataset, context, split, budget, num_pairs, rng)
             state_to_cell,
             goal_by_cell,
             context["cell_distances"],
-            context["steps_per_cell"],
+            context["label_distance_scale"],
             int(budget),
             int(num_pairs),
             rng,
@@ -420,6 +486,373 @@ def make_sup_fields(dataset, context, split, budgets, pairs_per_budget, rng):
         value_sup_valids=np.ones((len(rows), pairs_per_budget), dtype=np.float32),
         value_sup_distances=np.stack(distances, axis=0).astype(np.float32),
     )
+
+
+def bce_loss(pred_logit, target):
+    log_pred = jax.nn.log_sigmoid(pred_logit)
+    log_not_pred = jax.nn.log_sigmoid(-pred_logit)
+    return -(log_pred * target + log_not_pred * (1.0 - target))
+
+
+def select_witness_cells(
+    witness_mask,
+    left_distance,
+    right_distance,
+    left_budget,
+    right_budget,
+    num_witnesses,
+    rng,
+):
+    witness_cells = np.nonzero(witness_mask)[0]
+    if len(witness_cells) == 0:
+        return None
+
+    eps = float(FLAGS.trans_endpoint_epsilon)
+    non_endpoint = (left_distance > eps) & (right_distance > eps)
+    candidate_cells = witness_cells
+    fallback_used = 0.0
+
+    if FLAGS.trans_witness_mode == "avoid_endpoints":
+        preferred = witness_cells[non_endpoint[witness_cells]]
+        if len(preferred) > 0:
+            candidate_cells = preferred
+        else:
+            fallback_used = 1.0
+    elif FLAGS.trans_witness_mode == "boundary_balanced":
+        beta = float(FLAGS.trans_boundary_beta)
+        boundary_mask = (
+            non_endpoint
+            & (left_distance >= beta * float(left_budget))
+            & (right_distance >= beta * float(right_budget))
+        )
+        preferred = witness_cells[boundary_mask[witness_cells]]
+        if len(preferred) > 0:
+            candidate_cells = preferred
+        else:
+            non_endpoint_cells = witness_cells[non_endpoint[witness_cells]]
+            if len(non_endpoint_cells) > 0:
+                candidate_cells = non_endpoint_cells
+            fallback_used = 1.0
+    elif FLAGS.trans_witness_mode == "slack_balanced":
+        non_endpoint_cells = witness_cells[non_endpoint[witness_cells]]
+        if len(non_endpoint_cells) > 0:
+            candidate_cells = non_endpoint_cells
+        else:
+            fallback_used = 1.0
+        left_slack = float(left_budget) - left_distance[candidate_cells]
+        right_slack = float(right_budget) - right_distance[candidate_cells]
+        scores = -np.abs(left_slack - right_slack)
+        order = np.argsort(scores)[::-1]
+        top_count = min(
+            len(candidate_cells),
+            max(int(num_witnesses), int(np.ceil(0.25 * len(candidate_cells)))),
+        )
+        candidate_cells = candidate_cells[order[:top_count]]
+    elif FLAGS.trans_witness_mode != "uniform_valid":
+        raise ValueError(f"Unsupported trans_witness_mode={FLAGS.trans_witness_mode}")
+
+    replace = len(candidate_cells) < int(num_witnesses)
+    sampled = rng.choice(candidate_cells, size=int(num_witnesses), replace=replace)
+    unique_count = len(np.unique(sampled))
+    return dict(
+        witness_cells=witness_cells,
+        candidate_cells=candidate_cells,
+        sampled_witness_cells=sampled,
+        effective_unique_witness_count=float(unique_count),
+        unique_witness_frac=float(unique_count / float(num_witnesses)),
+        replacement_used=float(replace),
+        fallback_used=float(fallback_used),
+    )
+
+
+def sample_grid_qv_transitive_pairs(dataset, context, split, budgets, batch_size, rng):
+    """Sample Q/V-valid tuples for y=max_w min(Q_h(s,a,w), V_{H-h}(w,g))."""
+    if context["kind"] != "grid_geodesic":
+        raise ValueError("Q/V transitive sampling currently supports grid labels.")
+
+    state_to_cell = np.asarray(context[f"{split}_state_to_cell"], dtype=np.int32)
+    state_by_cell = context[f"{split}_goal_by_cell"]
+    has_state = np.asarray([len(items) > 0 for items in state_by_cell])
+    distances = np.asarray(context["cell_distances"], dtype=np.float32) * float(
+        context["label_distance_scale"]
+    )
+    src_idxs = valid_transition_indices(dataset)
+    src_idxs = src_idxs[src_idxs + 1 < len(state_to_cell)]
+    src_idxs = src_idxs[
+        (state_to_cell[src_idxs] >= 0) & (state_to_cell[src_idxs + 1] >= 0)
+    ]
+    budgets = tuple(int(x) for x in budgets)
+    num_witnesses = int(FLAGS.num_trans_witnesses)
+    if num_witnesses < 1:
+        raise ValueError("--num_trans_witnesses must be >= 1.")
+
+    observations = []
+    actions = []
+    goals = []
+    value_budgets = []
+    value_offsets = []
+    witness_observations = []
+    witness_actions = []
+    witness_goals = []
+    witness_offsets = []
+    left_budgets = []
+    right_budgets = []
+    trans_valids = []
+    parent_distances = []
+    left_distances = []
+    right_distances = []
+    left_slacks = []
+    right_slacks = []
+    witness_cell_counts = []
+    witness_candidate_counts = []
+    effective_unique_witness_counts = []
+    unique_witness_fracs = []
+    replacement_used = []
+    witness_fallback_used = []
+
+    attempts = 0
+    max_attempts = max(1000, int(batch_size) * 200)
+    while len(observations) < int(batch_size) and attempts < max_attempts:
+        attempts += 1
+        budget = int(rng.choice(budgets))
+        if budget <= 2:
+            continue
+        left_budget = max(1, budget // 2)
+        right_budget = max(1, budget - left_budget)
+        left_remaining = max(float(left_budget) - 1.0, 1.0)
+
+        src_idx = int(rng.choice(src_idxs))
+        next_cell = int(state_to_cell[src_idx + 1])
+        next_distances = distances[next_cell]
+        finite_goal = (context["cell_distances"][next_cell] >= 0) & has_state
+        goal_hi = max(float(budget) - 1.0, 1.0)
+        goal_lo = max(0.0, float(FLAGS.trans_pos_boundary_frac) * goal_hi)
+        goal_mask = (
+            finite_goal
+            & (next_distances >= goal_lo)
+            & (next_distances <= goal_hi)
+        )
+        if not goal_mask.any() and goal_lo > 0.0:
+            goal_mask = finite_goal & (next_distances <= goal_hi)
+        goal_cells = np.nonzero(goal_mask)[0]
+        if len(goal_cells) == 0:
+            continue
+
+        goal_cell = int(rng.choice(goal_cells))
+        right_to_goal = distances[:, goal_cell]
+        witness_mask = (
+            has_state
+            & (context["cell_distances"][next_cell] >= 0)
+            & (context["cell_distances"][:, goal_cell] >= 0)
+            & (next_distances <= left_remaining)
+            & (right_to_goal <= float(right_budget))
+        )
+        selection = select_witness_cells(
+            witness_mask,
+            next_distances,
+            right_to_goal,
+            left_remaining,
+            right_budget,
+            num_witnesses,
+            rng,
+        )
+        if selection is None:
+            continue
+
+        sampled_witness_cells = selection["sampled_witness_cells"]
+        goal_idx = int(rng.choice(state_by_cell[goal_cell]))
+        parent_distance = float(next_distances[goal_cell])
+        observations.append(np.asarray(dataset["observations"])[src_idx])
+        actions.append(np.asarray(dataset["actions"])[src_idx])
+        goals.append(np.asarray(dataset["observations"])[goal_idx])
+        value_budgets.append(budget)
+        value_offsets.append(parent_distance)
+        parent_distances.append(parent_distance)
+        witness_cell_counts.append(float(len(selection["witness_cells"])))
+        witness_candidate_counts.append(float(len(selection["candidate_cells"])))
+        effective_unique_witness_counts.append(
+            selection["effective_unique_witness_count"]
+        )
+        unique_witness_fracs.append(selection["unique_witness_frac"])
+        replacement_used.append(selection["replacement_used"])
+        witness_fallback_used.append(selection["fallback_used"])
+
+        parent_witness_observations = []
+        parent_witness_actions = []
+        parent_witness_goals = []
+        parent_witness_offsets = []
+        parent_left_budgets = []
+        parent_right_budgets = []
+        parent_valids = []
+        parent_left_distances = []
+        parent_right_distances = []
+        parent_left_slacks = []
+        parent_right_slacks = []
+        for witness_cell in sampled_witness_cells:
+            witness_cell = int(witness_cell)
+            witness_idx = int(rng.choice(state_by_cell[witness_cell]))
+            left_distance = float(next_distances[witness_cell])
+            right_distance = float(right_to_goal[witness_cell])
+            parent_witness_observations.append(
+                np.asarray(dataset["observations"])[witness_idx]
+            )
+            parent_witness_actions.append(np.asarray(dataset["actions"])[witness_idx])
+            parent_witness_goals.append(np.asarray(dataset["observations"])[witness_idx])
+            parent_witness_offsets.append(left_distance)
+            parent_left_budgets.append(left_budget)
+            parent_right_budgets.append(right_budget)
+            parent_valids.append(1.0)
+            parent_left_distances.append(left_distance)
+            parent_right_distances.append(right_distance)
+            parent_left_slacks.append(left_remaining - left_distance)
+            parent_right_slacks.append(float(right_budget) - right_distance)
+
+        witness_observations.append(parent_witness_observations)
+        witness_actions.append(parent_witness_actions)
+        witness_goals.append(parent_witness_goals)
+        witness_offsets.append(parent_witness_offsets)
+        left_budgets.append(parent_left_budgets)
+        right_budgets.append(parent_right_budgets)
+        trans_valids.append(parent_valids)
+        left_distances.append(parent_left_distances)
+        right_distances.append(parent_right_distances)
+        left_slacks.append(parent_left_slacks)
+        right_slacks.append(parent_right_slacks)
+
+    if len(observations) < int(batch_size):
+        raise ValueError(
+            f"Could not sample {batch_size} Q/V transitive tuples for split={split}; "
+            f"got {len(observations)} after {attempts} attempts."
+        )
+
+    return dict(
+        qv_observations=np.asarray(observations, dtype=np.float32),
+        qv_actions=np.asarray(actions, dtype=np.float32),
+        qv_goals=np.asarray(goals, dtype=np.float32),
+        qv_budgets=np.asarray(value_budgets, dtype=np.int32),
+        qv_offsets=np.rint(value_offsets).astype(np.int32),
+        qv_midpoint_observations=np.swapaxes(
+            np.asarray(witness_observations, dtype=np.float32), 0, 1
+        ),
+        qv_midpoint_actions=np.swapaxes(
+            np.asarray(witness_actions, dtype=np.float32), 0, 1
+        ),
+        qv_midpoint_goals=np.swapaxes(
+            np.asarray(witness_goals, dtype=np.float32), 0, 1
+        ),
+        qv_midpoint_offsets=np.rint(
+            np.swapaxes(np.asarray(witness_offsets, dtype=np.float32), 0, 1)
+        ).astype(np.int32),
+        qv_left_budgets=np.swapaxes(np.asarray(left_budgets, dtype=np.int32), 0, 1),
+        qv_right_budgets=np.swapaxes(np.asarray(right_budgets, dtype=np.int32), 0, 1),
+        qv_valids=np.swapaxes(np.asarray(trans_valids, dtype=np.float32), 0, 1),
+        qv_parent_distances=np.asarray(parent_distances, dtype=np.float32),
+        qv_left_distances=np.swapaxes(
+            np.asarray(left_distances, dtype=np.float32), 0, 1
+        ),
+        qv_right_distances=np.swapaxes(
+            np.asarray(right_distances, dtype=np.float32), 0, 1
+        ),
+        qv_left_slacks=np.swapaxes(np.asarray(left_slacks, dtype=np.float32), 0, 1),
+        qv_right_slacks=np.swapaxes(np.asarray(right_slacks, dtype=np.float32), 0, 1),
+        qv_witness_cell_counts=np.asarray(witness_cell_counts, dtype=np.float32),
+        qv_witness_candidate_counts=np.asarray(
+            witness_candidate_counts, dtype=np.float32
+        ),
+        qv_effective_unique_witness_counts=np.asarray(
+            effective_unique_witness_counts, dtype=np.float32
+        ),
+        qv_unique_witness_fracs=np.asarray(unique_witness_fracs, dtype=np.float32),
+        qv_replacement_used=np.asarray(replacement_used, dtype=np.float32),
+        qv_witness_fallback_used=np.asarray(witness_fallback_used, dtype=np.float32),
+        qv_sample_acceptance_rate=np.asarray(
+            float(len(observations)) / float(max(attempts, 1)), dtype=np.float32
+        ),
+        qv_attempts_per_sample=np.asarray(
+            float(attempts) / float(max(len(observations), 1)), dtype=np.float32
+        ),
+    )
+
+
+def qv_transitive_loss(agent, batch, grad_params, value_agent):
+    parent_logits = agent.critic_logits_for(
+        batch["qv_observations"],
+        batch["qv_actions"],
+        batch["qv_goals"],
+        batch["qv_budgets"],
+        offsets=batch["qv_offsets"],
+        grad_params=grad_params,
+    )
+    parent_r = jax.nn.sigmoid(parent_logits)
+
+    witness_goals = batch["qv_midpoint_goals"]
+    witness_shape = witness_goals.shape[:-1]
+    parent_observations = jnp.broadcast_to(
+        batch["qv_observations"][None, ...],
+        witness_shape + batch["qv_observations"].shape[-1:],
+    )
+    parent_actions = jnp.broadcast_to(
+        batch["qv_actions"][None, ...],
+        witness_shape + batch["qv_actions"].shape[-1:],
+    )
+    parent_goals = jnp.broadcast_to(
+        batch["qv_goals"][None, ...], witness_shape + batch["qv_goals"].shape[-1:]
+    )
+
+    first_logits = agent.critic_logits_for_pair_grid(
+        parent_observations,
+        parent_actions,
+        witness_goals,
+        batch["qv_left_budgets"],
+        offsets=batch["qv_midpoint_offsets"],
+        target=True,
+    )
+    second_logits = value_agent.critic_logits_for_pair_grid(
+        batch["qv_midpoint_observations"],
+        batch["qv_midpoint_actions"],
+        parent_goals,
+        batch["qv_right_budgets"],
+        offsets=batch["qv_right_budgets"],
+    )
+    first_r = jax.nn.sigmoid(first_logits)
+    second_r = jax.nn.sigmoid(second_logits)
+    witness_valids = jnp.asarray(batch["qv_valids"], dtype=first_r.dtype)
+    y_candidates = jnp.minimum(first_r, second_r)
+    y_candidates = jnp.where(witness_valids[None, ...] > 0, y_candidates, -1.0)
+    y_trans = jax.lax.stop_gradient(jnp.max(y_candidates, axis=1))
+    trans_valids = (witness_valids.max(axis=0) > 0).astype(parent_logits.dtype)
+    y_trans = jnp.clip(y_trans, 0.0, 1.0)
+    y_trans = jnp.where(trans_valids[None, :] > 0, y_trans, 0.0)
+    loss = masked_mean(bce_loss(parent_logits, y_trans), trans_valids)
+    return loss, dict(
+        loss_qv_trans=loss,
+        qv_parent_r_mean=masked_mean(parent_r, trans_valids),
+        qv_y_trans_mean=masked_mean(y_trans, trans_valids),
+        qv_first_r_mean=masked_mean(first_r, witness_valids),
+        qv_second_v_mean=masked_mean(second_r, witness_valids),
+        qv_valid_frac=trans_valids.mean(),
+    )
+
+
+@jax.jit
+def update_with_qv_trans(agent, batch, value_agent, lambda_qv_trans):
+    new_rng, rng = jax.random.split(agent.rng)
+
+    def loss_fn(grad_params):
+        critic_loss, critic_info = agent.critic_loss(batch, grad_params)
+        qv_loss, qv_info = qv_transitive_loss(
+            agent, batch, grad_params, value_agent
+        )
+        loss = critic_loss + lambda_qv_trans * qv_loss
+        info = {f"critic/{key}": value for key, value in critic_info.items()}
+        for key, value in qv_info.items():
+            info[f"critic/{key}"] = value
+        info["critic/total_loss_with_qv"] = loss
+        return loss, info
+
+    new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
+    agent.target_update(new_network, "critic")
+    return agent.replace(network=new_network, rng=new_rng), info
 
 
 def rank_correlation(x, y):
@@ -608,14 +1041,124 @@ def print_report(title, step, report, mono=None, loss=None):
         print("Q-V_next | skipped (no value checkpoint supplied)")
 
 
+def finite_mean(values):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return np.nan
+    finite = np.isfinite(values)
+    if not finite.any():
+        return np.nan
+    return float(values[finite].mean())
+
+
+def summarize_qv_transitive_batch(batch, budgets):
+    if batch is None:
+        return None
+    qv_budgets = np.asarray(batch["qv_budgets"])
+    qv_valids = np.asarray(batch["qv_valids"]) > 0
+    parent_distances = np.asarray(batch["qv_parent_distances"])
+    left_distances = np.asarray(batch["qv_left_distances"])
+    right_distances = np.asarray(batch["qv_right_distances"])
+    left_slacks = np.asarray(batch["qv_left_slacks"])
+    right_slacks = np.asarray(batch["qv_right_slacks"])
+    rows = []
+    for budget in budgets:
+        budget = int(budget)
+        parent_mask = qv_budgets == budget
+        witness_mask = qv_valids & parent_mask[None, :]
+        if not parent_mask.any():
+            continue
+        rows.append(
+            dict(
+                budget=budget,
+                count=int(parent_mask.sum()),
+                parent_distance_mean=finite_mean(parent_distances[parent_mask]),
+                left_distance_mean=finite_mean(left_distances[witness_mask]),
+                right_distance_mean=finite_mean(right_distances[witness_mask]),
+                left_slack_mean=finite_mean(left_slacks[witness_mask]),
+                right_slack_mean=finite_mean(right_slacks[witness_mask]),
+                witness_cell_count_mean=finite_mean(
+                    np.asarray(batch["qv_witness_cell_counts"])[parent_mask]
+                ),
+                witness_candidate_count_mean=finite_mean(
+                    np.asarray(batch["qv_witness_candidate_counts"])[parent_mask]
+                ),
+                effective_unique_witness_count_mean=finite_mean(
+                    np.asarray(batch["qv_effective_unique_witness_counts"])[
+                        parent_mask
+                    ]
+                ),
+                replacement_used_frac=finite_mean(
+                    np.asarray(batch["qv_replacement_used"])[parent_mask]
+                ),
+                unique_witness_frac=finite_mean(
+                    np.asarray(batch["qv_unique_witness_fracs"])[parent_mask]
+                ),
+                zero_left_frac=finite_mean(
+                    (left_distances[witness_mask] <= 1e-6).astype(np.float32)
+                ),
+                zero_right_frac=finite_mean(
+                    (right_distances[witness_mask] <= 1e-6).astype(np.float32)
+                ),
+            )
+        )
+    return dict(
+        qv_sample_acceptance_rate=float(np.asarray(batch["qv_sample_acceptance_rate"])),
+        qv_attempts_per_sample=float(np.asarray(batch["qv_attempts_per_sample"])),
+        num_trans_witnesses=int(np.asarray(qv_valids).shape[0]),
+        trans_witness_mode=str(FLAGS.trans_witness_mode),
+        budget_rows=rows,
+    )
+
+
+def print_qv_summary(summary, info):
+    if summary is None:
+        return
+    print(
+        "qv_trans | "
+        f"accept={format_metric(summary['qv_sample_acceptance_rate'])} | "
+        f"attempts/sample={format_metric(summary['qv_attempts_per_sample'])} | "
+        f"K={summary['num_trans_witnesses']} | "
+        f"mode={summary['trans_witness_mode']} | "
+        f"loss={format_metric(info.get('critic/loss_qv_trans', np.nan))}"
+    )
+    print("H | parents | parent_d | left_d | right_d | eff_K | repl | zero_l | zero_r")
+    print("--|---------|----------|--------|---------|-------|------|--------|-------")
+    for row in summary["budget_rows"]:
+        print(
+            f"{row['budget']:4d} | {row['count']:7d} | "
+            f"{format_metric(row['parent_distance_mean'])} | "
+            f"{format_metric(row['left_distance_mean'])} | "
+            f"{format_metric(row['right_distance_mean'])} | "
+            f"{format_metric(row['effective_unique_witness_count_mean'])} | "
+            f"{format_metric(row['replacement_used_frac'])} | "
+            f"{format_metric(row['zero_left_frac'])} | "
+            f"{format_metric(row['zero_right_frac'])}"
+        )
+
+
+def info_to_float_dict(info):
+    result = {}
+    for key, value in info.items():
+        try:
+            arr = np.asarray(value)
+            if arr.shape == ():
+                result[key] = float(arr)
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
 def context_metadata(context):
     if context["kind"] == "grid_geodesic":
         return dict(
             kind=context["kind"],
+            geodesic_budget_unit=context["geodesic_budget_unit"],
             maze_type=context["maze_type"],
             maze_unit=context["maze_unit"],
             median_step_xy=context["median_step_xy"],
             steps_per_cell=context["steps_per_cell"],
+            label_distance_scale=context["label_distance_scale"],
             free_cell_count=int(len(context["free_cells"])),
             distance_stats=context["distance_stats"],
         )
@@ -638,6 +1181,15 @@ def main(_):
     if config["agent_name"] != "bmm_trl":
         raise ValueError("train_bmm_geodesic_q.py requires bmm_trl.")
     budgets = parse_budgets(FLAGS.budgets)
+    trans_budgets = (
+        budgets if FLAGS.trans_budgets is None else parse_budgets(FLAGS.trans_budgets)
+    )
+    sup_pairs_per_budget = positive_or_default(
+        FLAGS.sup_pairs_per_budget, FLAGS.batch_size
+    )
+    trans_pairs_per_update = positive_or_default(
+        FLAGS.trans_pairs_per_update, FLAGS.batch_size
+    )
     configure_agent(config, budgets)
 
     xy_dims = parse_xy_dims(FLAGS.xy_dims)
@@ -649,7 +1201,14 @@ def main(_):
     print("BMM geodesic Q diagnostic")
     print(f"  env_name: {FLAGS.env_name}")
     print(f"  label_type: {context['kind']}")
+    print(f"  geodesic_budget_unit: {FLAGS.geodesic_budget_unit}")
     print(f"  budgets: {budgets}")
+    print(f"  trans_budgets: {trans_budgets}")
+    print(f"  lambda_qv_trans: {FLAGS.lambda_qv_trans}")
+    print(f"  num_trans_witnesses: {FLAGS.num_trans_witnesses}")
+    print(f"  trans_witness_mode: {FLAGS.trans_witness_mode}")
+    print(f"  sup_pairs_per_budget: {sup_pairs_per_budget}")
+    print(f"  trans_pairs_per_update: {trans_pairs_per_update}")
     print(f"  context: {context_metadata(context)}")
 
     dataset_class = {"GCDataset": GCDataset}[config["dataset"]["dataset_class"]]
@@ -671,6 +1230,11 @@ def main(_):
         value_agent = restore_agent(
             value_agent, FLAGS.value_restore_path, FLAGS.value_restore_epoch
         )
+    if FLAGS.lambda_qv_trans > 0.0 and value_agent is None:
+        raise ValueError(
+            "--lambda_qv_trans > 0 requires --value_restore_path and "
+            "--value_restore_epoch for the frozen V teacher."
+        )
 
     eval_batch = make_sup_fields(
         val_dataset,
@@ -685,20 +1249,43 @@ def main(_):
     eval_report = score_sup_batch(agent, eval_batch, budgets, value_agent=value_agent)
     eval_mono = monotonicity_violation(agent, eval_batch, budgets)
     print_report("eval", 0, eval_report, mono=eval_mono)
+    last_update_info = {}
+    qv_history = []
+    last_qv_summary = None
 
     for step in range(1, FLAGS.steps + 1):
-        train_batch = gc_train.sample(config.batch_size)
+        base_batch_size = (
+            trans_pairs_per_update if FLAGS.lambda_qv_trans > 0.0 else FLAGS.batch_size
+        )
+        train_batch = gc_train.sample(base_batch_size)
+        qv_fields = None
+        if FLAGS.lambda_qv_trans > 0.0:
+            qv_fields = sample_grid_qv_transitive_pairs(
+                train_dataset,
+                context,
+                "train",
+                trans_budgets,
+                trans_pairs_per_update,
+                rng,
+            )
+            train_batch.update(qv_fields)
         train_batch.update(
             make_sup_fields(
                 train_dataset,
                 context,
                 "train",
                 budgets,
-                config.batch_size,
+                sup_pairs_per_budget,
                 rng,
             )
         )
-        agent, info = agent.update(train_batch)
+        if FLAGS.lambda_qv_trans > 0.0:
+            agent, info = update_with_qv_trans(
+                agent, train_batch, value_agent, FLAGS.lambda_qv_trans
+            )
+        else:
+            agent, info = agent.update(train_batch)
+        last_update_info = info_to_float_dict(info)
         final_loss = float(info["critic/loss_sup"])
         if step % FLAGS.eval_interval == 0 or step == FLAGS.steps:
             train_report = score_sup_batch(
@@ -709,7 +1296,11 @@ def main(_):
             )
             train_mono = monotonicity_violation(agent, train_batch, budgets)
             eval_mono = monotonicity_violation(agent, eval_batch, budgets)
+            last_qv_summary = summarize_qv_transitive_batch(qv_fields, trans_budgets)
+            if last_qv_summary is not None:
+                qv_history.append(dict(step=int(step), train=last_qv_summary))
             print_report("train", step, train_report, mono=train_mono, loss=final_loss)
+            print_qv_summary(last_qv_summary, last_update_info)
             print_report("eval", step, eval_report, mono=eval_mono)
 
     final_passed = passed(eval_report, budgets)
@@ -718,16 +1309,28 @@ def main(_):
         train=train_report,
         eval=eval_report,
         eval_monotonicity_violation=eval_mono,
+        last_update_info=last_update_info,
+        last_qv_summary=last_qv_summary,
+        qv_history=qv_history,
         passed=bool(final_passed),
         config=dict(
             env_name=FLAGS.env_name,
             reachability_label_type=FLAGS.reachability_label_type,
             budgets=[int(x) for x in budgets],
+            trans_budgets=[int(x) for x in trans_budgets],
             batch_size=int(FLAGS.batch_size),
+            sup_pairs_per_budget=int(sup_pairs_per_budget),
+            trans_pairs_per_update=int(trans_pairs_per_update),
             eval_pairs=int(FLAGS.eval_pairs),
             steps=int(FLAGS.steps),
             eval_interval=int(FLAGS.eval_interval),
             final_loss_sup=final_loss,
+            lambda_qv_trans=float(FLAGS.lambda_qv_trans),
+            trans_pos_boundary_frac=float(FLAGS.trans_pos_boundary_frac),
+            num_trans_witnesses=int(FLAGS.num_trans_witnesses),
+            trans_witness_mode=str(FLAGS.trans_witness_mode),
+            trans_endpoint_epsilon=float(FLAGS.trans_endpoint_epsilon),
+            trans_boundary_beta=float(FLAGS.trans_boundary_beta),
             value_restore_path=FLAGS.value_restore_path,
             value_restore_epoch=FLAGS.value_restore_epoch,
             context=context_metadata(context),

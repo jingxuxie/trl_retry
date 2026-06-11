@@ -20,6 +20,7 @@ from agents import agents
 from envs.env_utils import make_env_and_datasets
 from scripts.bmm_reachability_utils import binary_metrics, format_metric, rank_metrics
 from utils.datasets import Dataset, GCDataset
+from utils.flax_utils import save_agent
 from utils.pointmaze_graph import (
     adjacency_lists,
     build_dataset_position_graph,
@@ -54,6 +55,12 @@ flags.DEFINE_string(
 flags.DEFINE_string("graph_path", "exp/bmm_pointmaze_graph.npz", "Graph npz path.")
 flags.DEFINE_bool("rebuild_graph", False, "Rebuild graph labels even if graph exists.")
 flags.DEFINE_string("xy_dims", "0,1", "Comma-separated observation dims to use as xy.")
+flags.DEFINE_enum(
+    "geodesic_budget_unit",
+    "env_steps",
+    ["env_steps", "grid_cells"],
+    "Budget units for grid_geodesic labels.",
+)
 flags.DEFINE_integer("seed", 0, "Random seed.")
 flags.DEFINE_string("budgets", "(32, 64, 96, 128)", "Budgets to train/evaluate.")
 flags.DEFINE_integer("batch_size", 256, "Training pairs per budget per update.")
@@ -120,6 +127,12 @@ flags.DEFINE_bool(
     False,
     "Exit nonzero if final heldout metrics do not pass thresholds.",
 )
+flags.DEFINE_string("save_dir", None, "Optional directory to save agent checkpoints.")
+flags.DEFINE_integer(
+    "save_interval",
+    0,
+    "Save every N updates when --save_dir is set; <=0 disables periodic saving.",
+)
 flags.DEFINE_string("output_json", None, "Optional path to write final metrics.")
 
 config_flags.DEFINE_config_file("agent", "agents/bmm_trl.py", lock_config=False)
@@ -179,6 +192,9 @@ def make_grid_context(env, train_dataset, val_dataset, xy_dims):
     maze_env = unwrap_maze_env(env)
     median_step = median_step_xy((train_dataset, val_dataset), xy_dims)
     steps_per_cell = float(maze_env._maze_unit) / median_step
+    label_distance_scale = (
+        1.0 if FLAGS.geodesic_budget_unit == "grid_cells" else steps_per_cell
+    )
     free_cells, cell_distances = free_cell_distance_matrix(maze_env.maze_map)
     train_state_to_cell = state_to_free_cell_indices(
         train_dataset,
@@ -202,13 +218,15 @@ def make_grid_context(env, train_dataset, val_dataset, xy_dims):
         train_state_to_cell, len(free_cells)
     )
     val_goal_by_cell = free_cell_to_state_indices(val_state_to_cell, len(free_cells))
-    stats = grid_distance_statistics(cell_distances, steps_per_cell)
+    stats = grid_distance_statistics(cell_distances, label_distance_scale)
     return dict(
         kind="grid_geodesic",
+        geodesic_budget_unit=str(FLAGS.geodesic_budget_unit),
         maze_type=maze_env._maze_type,
         maze_unit=float(maze_env._maze_unit),
         median_step_xy=float(median_step),
         steps_per_cell=float(steps_per_cell),
+        label_distance_scale=float(label_distance_scale),
         free_cells=free_cells,
         cell_distances=cell_distances,
         train_state_to_cell=train_state_to_cell,
@@ -263,7 +281,7 @@ def sample_context_budget_pairs(dataset, context, split, budget, num_pairs, rng)
             state_to_cell,
             goal_by_cell,
             context["cell_distances"],
-            context["steps_per_cell"],
+            context["label_distance_scale"],
             int(budget),
             int(num_pairs),
             rng,
@@ -408,7 +426,7 @@ def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size,
     state_by_cell = context[f"{split}_goal_by_cell"]
     has_state = np.asarray([len(items) > 0 for items in state_by_cell])
     step_distances = np.asarray(context["cell_distances"], dtype=np.float32) * float(
-        context["steps_per_cell"]
+        context["label_distance_scale"]
     )
     src_idxs = source_indices(dataset)
     src_idxs = src_idxs[state_to_cell[src_idxs] >= 0]
@@ -942,10 +960,12 @@ def context_metadata(context):
     if context["kind"] == "grid_geodesic":
         return dict(
             kind=context["kind"],
+            geodesic_budget_unit=context["geodesic_budget_unit"],
             maze_type=context["maze_type"],
             maze_unit=context["maze_unit"],
             median_step_xy=context["median_step_xy"],
             steps_per_cell=context["steps_per_cell"],
+            label_distance_scale=context["label_distance_scale"],
             free_cell_count=int(len(context["free_cells"])),
             distance_stats=context["distance_stats"],
         )
@@ -985,6 +1005,7 @@ def main(_):
     print("BMM geodesic value diagnostic")
     print(f"  env_name: {FLAGS.env_name}")
     print(f"  label_type: {context['kind']}")
+    print(f"  geodesic_budget_unit: {FLAGS.geodesic_budget_unit}")
     print(f"  budgets: {budgets}")
     print(f"  lambda_trans: {FLAGS.lambda_trans}")
     print(f"  num_trans_witnesses: {FLAGS.num_trans_witnesses}")
@@ -997,6 +1018,8 @@ def main(_):
     gc_train = dataset_class(Dataset.create(**train_dataset), config)
     example_batch = gc_train.sample(1)
     agent = agents[config["agent_name"]].create(FLAGS.seed, example_batch, config)
+    if FLAGS.save_dir is not None:
+        Path(FLAGS.save_dir).mkdir(parents=True, exist_ok=True)
 
     eval_batch = make_sup_fields(
         val_dataset,
@@ -1044,6 +1067,12 @@ def main(_):
         agent, info = agent.update(train_batch)
         last_update_info = info_to_float_dict(info)
         final_loss = float(info["critic/loss_sup"])
+        if (
+            FLAGS.save_dir is not None
+            and FLAGS.save_interval > 0
+            and step % FLAGS.save_interval == 0
+        ):
+            save_agent(agent, FLAGS.save_dir, step)
         if step % FLAGS.eval_interval == 0 or step == FLAGS.steps:
             train_report = score_sup_batch(agent, train_batch, budgets)
             eval_report = score_sup_batch(agent, eval_batch, budgets)
@@ -1087,6 +1116,8 @@ def main(_):
             trans_witness_mode=str(FLAGS.trans_witness_mode),
             trans_endpoint_epsilon=float(FLAGS.trans_endpoint_epsilon),
             trans_boundary_beta=float(FLAGS.trans_boundary_beta),
+            save_dir=FLAGS.save_dir,
+            save_interval=int(FLAGS.save_interval),
             context=context_metadata(context),
         ),
     )
