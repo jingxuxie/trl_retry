@@ -109,6 +109,19 @@ def main():
         budgets
     )
 
+    oracle_augmented = augment_goal_with_budget(
+        pair_batch["goals"],
+        pair_batch["budgets"],
+        config.max_budget,
+        offset=pair_batch["offsets"],
+        oracle_offset_feature=True,
+    )
+    assert oracle_augmented.shape[-1] == pair_batch["goals"].shape[-1] + 2
+    expected_offset_feature = np.asarray(
+        normalize_budget(pair_batch["offsets"], config.max_budget)
+    )
+    assert np.allclose(np.asarray(oracle_augmented[:, -1]), expected_offset_feature)
+
     print("BMM reachability diagnostic sampler checks passed.")
 
 

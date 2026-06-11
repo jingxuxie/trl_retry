@@ -92,6 +92,18 @@ def print_report(report):
                 f"{format_metric(ens_min['auc'])} | {mean['pos_count']:5d} | {mean['neg_count']:5d}"
             )
 
+        print("\nBalanced baseline AUCs")
+        print("H | offset_oracle | euclidean | action_goal")
+        print("--|---------------|-----------|------------")
+        for row in report["balanced_budget_rows"]:
+            baselines = row.get("baselines", {})
+            print(
+                f"{row['budget']:4d} | "
+                f"{format_metric(baselines.get('offset_oracle', {}).get('auc'))} | "
+                f"{format_metric(baselines.get('euclidean', {}).get('auc'))} | "
+                f"{format_metric(baselines.get('action_goal', {}).get('auc'))}"
+            )
+
     print("\nOffset buckets")
     print("H | offset | offset/H | label | mean_score | min_score | n")
     print("--|--------|----------|-------|------------|-----------|---")
@@ -119,6 +131,9 @@ def write_outputs(report):
             ):
                 for key, value in metrics.items():
                     flat[f"{prefix}_{key}"] = value
+            for baseline_name, metrics in row.get("baselines", {}).items():
+                for key, value in metrics.items():
+                    flat[f"baseline_{baseline_name}_{key}"] = value
             rows.append(flat)
         for row in report.get("balanced_budget_rows", []):
             flat = {"kind": "balanced_budget", "budget": row["budget"]}
@@ -128,6 +143,9 @@ def write_outputs(report):
             ):
                 for key, value in metrics.items():
                     flat[f"{prefix}_{key}"] = value
+            for baseline_name, metrics in row.get("baselines", {}).items():
+                for key, value in metrics.items():
+                    flat[f"baseline_{baseline_name}_{key}"] = value
             rows.append(flat)
         for row in report["bucket_rows"]:
             flat = {"kind": "bucket"}

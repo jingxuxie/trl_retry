@@ -55,6 +55,8 @@ def augment_goal_with_budget(
     max_budget,
     budgets=None,
     budget_feature="log_scalar",
+    offset=None,
+    oracle_offset_feature=False,
 ):
     """Append budget features to vector goals."""
     if isinstance(goal, (dict, flax.core.FrozenDict)):
@@ -70,6 +72,14 @@ def augment_goal_with_budget(
     b = normalize_budget(budget, max_budget)
     b = _broadcast_budget_like_goal(b, goal)
     features = [goal, b[..., None]]
+
+    if oracle_offset_feature:
+        if offset is None:
+            offset_feature = jnp.zeros(goal.shape[:-1], dtype=goal.dtype)
+        else:
+            offset_feature = normalize_budget(offset, max_budget)
+            offset_feature = _broadcast_budget_like_goal(offset_feature, goal)
+        features.append(offset_feature[..., None])
 
     if budget_feature == "log_scalar_onehot":
         if budgets is None:
@@ -110,33 +120,50 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
     network: Any
     config: Any = nonpytree_field()
 
-    def augment_goal(self, goal, budget):
+    def maybe_actions(self, actions):
+        if self.config.get("diagnostic_critic_mode", "action") == "state":
+            return None
+        return actions
+
+    def augment_goal(self, goal, budget, offset=None):
         return augment_goal_with_budget(
             goal,
             budget,
             self.config["max_budget"],
             budgets=config_budgets(self.config),
             budget_feature=self.config["budget_feature"],
+            offset=offset,
+            oracle_offset_feature=self.config.get("oracle_offset_feature", False),
         )
 
-    def critic_logits_for(self, observations, actions, goals, budgets, grad_params=None, target=False):
+    def critic_logits_for(
+        self,
+        observations,
+        actions,
+        goals,
+        budgets,
+        offsets=None,
+        grad_params=None,
+        target=False,
+    ):
         module = "target_critic" if target else "critic"
-        aug_goals = self.augment_goal(goals, budgets)
+        aug_goals = self.augment_goal(goals, budgets, offsets)
+        maybe_actions = self.maybe_actions(actions)
         if grad_params is None or target:
             return self.network.select(module)(
                 observations,
                 goals=aug_goals,
-                actions=actions,
+                actions=maybe_actions,
             )
         return self.network.select(module)(
             observations,
             goals=aug_goals,
-            actions=actions,
+            actions=maybe_actions,
             params=grad_params,
         )
 
     def critic_logits_for_pair_grid(
-        self, observations, actions, goals, budgets, grad_params=None
+        self, observations, actions, goals, budgets, offsets=None, grad_params=None
     ):
         budgets = jnp.asarray(budgets)
         leading_shape = budgets.shape
@@ -149,11 +176,13 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             lambda x: jnp.reshape(x, (-1,) + x.shape[leading_ndim:]), goals
         )
         flat_budgets = jnp.reshape(budgets, (-1,))
+        flat_offsets = None if offsets is None else jnp.reshape(offsets, (-1,))
         flat_logits = self.critic_logits_for(
             flat_observations,
             flat_actions,
             flat_goals,
             flat_budgets,
+            offsets=flat_offsets,
             grad_params=grad_params,
         )
         return jnp.reshape(flat_logits, flat_logits.shape[:1] + leading_shape)
@@ -175,6 +204,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             batch["actions"],
             batch[goal_key],
             batch["value_budgets"],
+            offsets=batch.get("value_offsets"),
             grad_params=grad_params,
         )
         r = jax.nn.sigmoid(r_logits)
@@ -184,6 +214,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             batch["actions"],
             batch["value_midpoint_goals"],
             batch["value_left_budgets"],
+            offsets=batch.get("value_midpoint_offsets", batch["value_left_budgets"]),
             target=True,
         )
         first_r = jax.nn.sigmoid(first_logits)
@@ -193,6 +224,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             batch["value_midpoint_actions"],
             batch[goal_key],
             batch["value_right_budgets"],
+            offsets=batch["value_right_budgets"],
             target=True,
         )
         second_r = jax.nn.sigmoid(second_logits)
@@ -208,6 +240,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             batch["actions"],
             batch[goal_key],
             batch["value_neg_budgets"],
+            offsets=batch.get("value_offsets"),
             grad_params=grad_params,
         )
         neg_r = jax.nn.sigmoid(neg_logits)
@@ -221,6 +254,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             batch["actions"],
             batch["value_hard_neg_goals"],
             batch["value_hard_neg_budgets"],
+            offsets=batch.get("value_hard_neg_offsets"),
             grad_params=grad_params,
         )
         hard_neg_r = jax.nn.sigmoid(hard_neg_logits)
@@ -246,6 +280,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             batch["actions"],
             batch[goal_key],
             batch["mono_low_budgets"],
+            offsets=batch.get("value_offsets"),
             grad_params=grad_params,
         )
         high_logits = self.critic_logits_for(
@@ -253,6 +288,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             batch["actions"],
             batch[goal_key],
             batch["mono_high_budgets"],
+            offsets=batch.get("value_offsets"),
             grad_params=grad_params,
         )
         low_r = jax.nn.sigmoid(low_logits)
@@ -265,6 +301,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
                 batch["value_sup_actions"],
                 batch["value_sup_goals"],
                 batch["value_sup_budgets"],
+                offsets=batch["value_sup_offsets"],
                 grad_params=grad_params,
             )
             sup_labels = jnp.asarray(batch["value_sup_labels"], dtype=sup_logits.dtype)
@@ -284,6 +321,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
                 batch["value_rank_actions"],
                 batch["value_rank_goals"],
                 batch["value_rank_pos_budgets"],
+                offsets=batch["value_rank_offsets"],
                 grad_params=grad_params,
             )
             rank_neg_logits = self.critic_logits_for_pair_grid(
@@ -291,6 +329,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
                 batch["value_rank_actions"],
                 batch["value_rank_goals"],
                 batch["value_rank_neg_budgets"],
+                offsets=batch["value_rank_offsets"],
                 grad_params=grad_params,
             )
             rank_valids = jnp.asarray(
@@ -490,6 +529,9 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
         for k, v in critic_info.items():
             info[f"critic/{k}"] = v
 
+        if self.config.get("value_only", False):
+            return critic_loss, info
+
         rng, actor_rng = jax.random.split(rng)
         actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
         for k, v in actor_info.items():
@@ -600,6 +642,18 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
                 "BMM-TRL supports budget_feature='log_scalar' or "
                 "'log_scalar_onehot'."
             )
+        if config.get("diagnostic_critic_mode", "action") not in ("action", "state"):
+            raise ValueError(
+                "BMM-TRL supports diagnostic_critic_mode='action' or 'state'."
+            )
+        if (
+            config.get("diagnostic_critic_mode", "action") == "state"
+            and not config.get("value_only", False)
+        ):
+            raise ValueError(
+                "diagnostic_critic_mode='state' is diagnostic-only and requires "
+                "value_only=True."
+            )
         if config["split_mode"] != "half":
             raise ValueError("BMM-TRL prototype only supports split_mode='half'.")
 
@@ -613,7 +667,8 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
         action_dim = ex_actions.shape[-1]
         pe_info = config[config["pe_type"]]
 
-        if config["pe_type"] == "discrete":
+        critic_mode = config.get("diagnostic_critic_mode", "action")
+        if config["pe_type"] == "discrete" and critic_mode == "action":
             critic_def = GCDiscreteCritic(
                 hidden_dims=config["value_hidden_dims"],
                 layer_norm=config["layer_norm"],
@@ -657,13 +712,16 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             config["max_budget"],
             budgets=config_budgets(config),
             budget_feature=config["budget_feature"],
+            oracle_offset_feature=config.get("oracle_offset_feature", False),
+        )
+        critic_in = (
+            (ex_observations, ex_critic_goals)
+            if critic_mode == "state"
+            else (ex_observations, ex_critic_goals, ex_actions)
         )
         network_info = dict(
-            critic=(critic_def, (ex_observations, ex_critic_goals, ex_actions)),
-            target_critic=(
-                copy.deepcopy(critic_def),
-                (ex_observations, ex_critic_goals, ex_actions),
-            ),
+            critic=(critic_def, critic_in),
+            target_critic=(copy.deepcopy(critic_def), critic_in),
             actor=(actor_def, ex_actor_in),
         )
         networks = {k: v[0] for k, v in network_info.items()}
@@ -729,6 +787,9 @@ def get_config():
             rand_hinge_rho=0.3,
             actor_budget_mode="max",
             actor_budget_threshold=0.5,
+            diagnostic_critic_mode="action",
+            value_only=False,
+            oracle_offset_feature=False,
             dataset=mlc.ConfigDict(
                 dict(
                     dataset_class="GCDataset",

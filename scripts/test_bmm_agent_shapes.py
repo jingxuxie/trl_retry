@@ -128,6 +128,36 @@ def main():
     for key, value in onehot_info.items():
         assert bool(jnp.all(jnp.isfinite(value))), f"Non-finite metric {key}: {value}"
 
+    state_config = make_config()
+    state_config.diagnostic_critic_mode = "state"
+    state_config.value_only = True
+    state_config.lambda_mono = 0.0
+    state_config.lambda_rank = 0.0
+    state_config.num_rank_pairs = 0
+    state_dataset = GCDataset(make_fake_dataset(), state_config)
+    state_example_batch = state_dataset.sample(1)
+    state_batch = state_dataset.sample(state_config.batch_size)
+    state_agent = BMMTRLAgent.create(6, state_example_batch, state_config)
+    _, state_info = state_agent.update(state_batch)
+    assert "critic/loss_sup" in state_info
+    assert "actor/actor_loss" not in state_info
+    for key, value in state_info.items():
+        assert bool(jnp.all(jnp.isfinite(value))), f"Non-finite metric {key}: {value}"
+
+    oracle_config = make_config()
+    oracle_config.oracle_offset_feature = True
+    oracle_config.value_only = True
+    oracle_config.lambda_rank = 0.0
+    oracle_config.num_rank_pairs = 0
+    oracle_dataset = GCDataset(make_fake_dataset(), oracle_config)
+    oracle_example_batch = oracle_dataset.sample(1)
+    oracle_batch = oracle_dataset.sample(oracle_config.batch_size)
+    oracle_agent = BMMTRLAgent.create(7, oracle_example_batch, oracle_config)
+    _, oracle_info = oracle_agent.update(oracle_batch)
+    assert "critic/loss_sup" in oracle_info
+    for key, value in oracle_info.items():
+        assert bool(jnp.all(jnp.isfinite(value))), f"Non-finite metric {key}: {value}"
+
     print("BMM agent update and sample_actions smoke checks passed.")
 
 

@@ -10,7 +10,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from agents.bmm_trl import augment_goal_with_budget
 from utils.datasets import get_bmm_budgets
 
 
@@ -146,7 +145,6 @@ def score_pair_batch(agent, pair_batch, batch_size=8192):
     mean_scores = []
     min_scores = []
     num_pairs = len(pair_batch["offsets"])
-    max_budget = agent.config["max_budget"]
 
     for start in range(0, num_pairs, batch_size):
         end = min(start + batch_size, num_pairs)
@@ -154,23 +152,63 @@ def score_pair_batch(agent, pair_batch, batch_size=8192):
         actions = pair_batch["actions"][start:end]
         goals = pair_batch["goals"][start:end]
         budgets = pair_batch["budgets"][start:end]
-        aug_goals = augment_goal_with_budget(
+        offsets = pair_batch["offsets"][start:end]
+        logits = agent.critic_logits_for(
+            observations,
+            actions,
             goals,
             budgets,
-            max_budget,
-            budgets=get_bmm_budgets(agent.config),
-            budget_feature=agent.config.get("budget_feature", "log_scalar"),
-        )
-        logits = agent.network.select("critic")(
-            observations,
-            goals=aug_goals,
-            actions=actions,
+            offsets=offsets,
         )
         scores = np.asarray(jax.nn.sigmoid(logits))
         mean_scores.append(scores.mean(axis=0))
         min_scores.append(scores.min(axis=0))
 
     return np.concatenate(mean_scores), np.concatenate(min_scores)
+
+
+def rank_metrics(scores, labels):
+    """Return AUC and class means for arbitrary rank scores."""
+    scores = np.asarray(scores, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.float64)
+    pos_mask = labels == 1.0
+    neg_mask = ~pos_mask
+    pos_mean = float(scores[pos_mask].mean()) if pos_mask.any() else np.nan
+    neg_mean = float(scores[neg_mask].mean()) if neg_mask.any() else np.nan
+    return dict(
+        auc=float(binary_auc(scores, labels)),
+        pos_mean=pos_mean,
+        neg_mean=neg_mean,
+        gap=float(pos_mean - neg_mean)
+        if np.isfinite(pos_mean) and np.isfinite(neg_mean)
+        else np.nan,
+        pos_count=int(pos_mask.sum()),
+        neg_count=int(neg_mask.sum()),
+    )
+
+
+def baseline_metrics(pair_batch):
+    """Compute simple non-neural reachability ranking baselines."""
+    labels = pair_batch["labels"]
+    offsets = np.asarray(pair_batch["offsets"], dtype=np.float64)
+    observations = np.asarray(pair_batch["observations"], dtype=np.float64)
+    goals = np.asarray(pair_batch["goals"], dtype=np.float64)
+    actions = np.asarray(pair_batch["actions"], dtype=np.float64)
+
+    dim = min(2, observations.shape[-1], goals.shape[-1])
+    deltas = goals[..., :dim] - observations[..., :dim]
+    euclidean_scores = -np.linalg.norm(deltas, axis=-1)
+
+    action_dim = min(dim, actions.shape[-1])
+    action_goal_scores = np.sum(
+        actions[..., :action_dim] * deltas[..., :action_dim], axis=-1
+    )
+
+    return dict(
+        offset_oracle=rank_metrics(-offsets, labels),
+        euclidean=rank_metrics(euclidean_scores, labels),
+        action_goal=rank_metrics(action_goal_scores, labels),
+    )
 
 
 def binary_auc(scores, labels):
@@ -253,6 +291,7 @@ def evaluate_reachability(
                 budget=int(budget),
                 mean=mean_metrics,
                 ensemble_min=min_metrics,
+                baselines=baseline_metrics(pair_batch),
             )
         )
         mean_score_by_budget.append(mean_scores)
@@ -278,6 +317,7 @@ def evaluate_reachability(
                     ensemble_min=binary_metrics(
                         balanced_min_scores, balanced_labels
                     ),
+                    baselines=baseline_metrics(balanced_batch),
                 )
             )
 
