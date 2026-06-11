@@ -116,6 +116,24 @@ def build_run_specs(args):
     return specs
 
 
+def variant_key(variant):
+    return str(variant).split("_", 1)[0]
+
+
+def filter_run_specs(specs, variants):
+    requested = [part.strip() for part in str(variants).split(",") if part.strip()]
+    if not requested:
+        return specs
+    requested_keys = {part.split("_", 1)[0] for part in requested}
+    requested_names = set(requested)
+    return [
+        spec
+        for spec in specs
+        if variant_key(spec["variant"]) in requested_keys
+        or spec["variant"] in requested_names
+    ]
+
+
 def run_id(spec):
     return (
         f"seed{spec['seed']}_{spec['variant']}_"
@@ -307,6 +325,14 @@ def parse_args(argv):
     parser.add_argument("--supervised_budgets", default="2,4")
     parser.add_argument("--trans_budgets", default="8")
     parser.add_argument("--seeds", default="0")
+    parser.add_argument(
+        "--variants",
+        default="A,B,C,D,E,F,G",
+        help=(
+            "Comma-separated variant letters or names to run. "
+            "Use A,B,C,D,F for the minimal budget-holdout replication."
+        ),
+    )
     parser.add_argument("--sup_pairs_per_budget", type=int, default=256)
     parser.add_argument("--few_parent_pairs", type=int, default=16)
     parser.add_argument("--qv_lambda", type=float, default=0.01)
@@ -341,7 +367,7 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     run_dir = Path(args.run_dir) if args.run_dir is not None else default_run_dir()
     run_dir.mkdir(parents=True, exist_ok=True)
-    specs = build_run_specs(args)
+    specs = filter_run_specs(build_run_specs(args), args.variants)
     trans_budgets = parse_int_list(args.trans_budgets)
     all_rows = []
     for spec in specs:

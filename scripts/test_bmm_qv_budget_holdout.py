@@ -29,6 +29,8 @@ def main():
     assert [spec["variant"][0] for spec in specs] == list("ABCDEFG")
     assert any(spec["qv_branch_mode"] == "oracle_q_oracle_v" for spec in specs)
     assert any(spec["lambda_vnext_distill"] > 0.0 for spec in specs)
+    filtered = holdout.filter_run_specs(specs, "A,B,C,D,F")
+    assert [spec["variant"][0] for spec in filtered] == list("ABCDF")
 
     spec = specs[1]
     assert spec["variant"] == "B_no_parent_qv_trans"
