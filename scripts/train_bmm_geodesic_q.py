@@ -968,6 +968,7 @@ def q_v_next_consistency(agent, batch, value_agent=None):
     q_scores = np.asarray(jax.nn.sigmoid(q_logits)).mean(axis=0)
     labels = np.asarray(batch["value_sup_labels"])
     valids = np.asarray(batch["value_sup_valids"]) > 0
+    budgets = np.asarray(batch["value_sup_budgets"])
     if value_agent is None:
         return dict(value_checkpoint_available=False)
 
@@ -979,11 +980,25 @@ def q_v_next_consistency(agent, batch, value_agent=None):
         offsets=batch["value_sup_offsets"],
     )
     v_scores = np.asarray(jax.nn.sigmoid(v_logits)).mean(axis=0)
+    v_next_budget_rows = []
+    for budget in sorted(np.unique(budgets[valids]).astype(np.int32)):
+        mask = valids & (budgets == int(budget))
+        if not mask.any():
+            continue
+        v_next_budget_rows.append(
+            dict(
+                budget=int(budget),
+                metrics=binary_metrics(v_scores[mask], labels[mask]),
+            )
+        )
+    v_next_metrics = binary_metrics(v_scores[valids], labels[valids])
     return dict(
         value_checkpoint_available=True,
         mean_abs_prob_diff=float(np.abs(q_scores[valids] - v_scores[valids]).mean()),
         rank_correlation=rank_correlation(q_scores[valids], v_scores[valids]),
         v_next_auc=rank_metrics(v_scores[valids], labels[valids])["auc"],
+        v_next_metrics=v_next_metrics,
+        v_next_budget_rows=v_next_budget_rows,
     )
 
 

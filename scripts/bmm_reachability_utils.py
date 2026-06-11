@@ -236,17 +236,57 @@ def binary_auc(scores, labels):
     return (pos_rank_sum - num_pos * (num_pos + 1) / 2.0) / (num_pos * num_neg)
 
 
-def binary_metrics(scores, labels):
-    """Return BCE, accuracy, score means, counts, and AUC."""
+def calibration_error(scores, labels, num_bins=10):
+    """Return fixed-bin expected calibration error for binary scores."""
     scores = np.asarray(scores, dtype=np.float64)
     labels = np.asarray(labels, dtype=np.float64)
+    if scores.size == 0:
+        return np.nan
+    bins = np.linspace(0.0, 1.0, int(num_bins) + 1)
+    ece = 0.0
+    for idx in range(int(num_bins)):
+        lo = bins[idx]
+        hi = bins[idx + 1]
+        if idx == int(num_bins) - 1:
+            mask = (scores >= lo) & (scores <= hi)
+        else:
+            mask = (scores >= lo) & (scores < hi)
+        if not mask.any():
+            continue
+        confidence = float(scores[mask].mean())
+        accuracy = float(labels[mask].mean())
+        ece += float(mask.mean()) * abs(confidence - accuracy)
+    return float(ece)
+
+
+def binary_metrics(scores, labels):
+    """Return BCE, accuracy, calibration, score means, counts, and AUC."""
+    scores = np.asarray(scores, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.float64)
+    if scores.size == 0:
+        return dict(
+            bce=np.nan,
+            accuracy=np.nan,
+            ece=np.nan,
+            pos_mean=np.nan,
+            neg_mean=np.nan,
+            auc=np.nan,
+            pos_count=0,
+            neg_count=0,
+        )
     clipped = np.clip(scores, 1e-6, 1.0 - 1e-6)
     pos_mask = labels == 1.0
     neg_mask = ~pos_mask
     preds = scores >= 0.5
     return dict(
-        bce=float(-(labels * np.log(clipped) + (1.0 - labels) * np.log(1.0 - clipped)).mean()),
+        bce=float(
+            -(
+                labels * np.log(clipped)
+                + (1.0 - labels) * np.log(1.0 - clipped)
+            ).mean()
+        ),
         accuracy=float((preds == pos_mask).mean()),
+        ece=calibration_error(scores, labels, num_bins=10),
         pos_mean=float(scores[pos_mask].mean()) if pos_mask.any() else np.nan,
         neg_mean=float(scores[neg_mask].mean()) if neg_mask.any() else np.nan,
         auc=float(binary_auc(scores, labels)),
