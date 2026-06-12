@@ -327,7 +327,18 @@ This directly tests whether shorter-budget reachability knowledge can bootstrap 
 
 All experiments were performed on PointMaze-medium diagnostics unless otherwise stated. Detailed logs are available in the repository result files.
 
-### 6.1 Logged-offset labels fail
+### 6.1 Tabular error scaling
+
+The tabular sanity check now emits an error-scaling artifact for the core algebraic claim. With per-level residual \(\varepsilon=0.02\), the balanced max-min recurrence grows from 0.02 at \(H=1\) to 0.22 at \(H=1024\), while the additive/product-style recurrence grows to 20.48:
+
+| H | BMM balanced sup error | Additive/product sup error |
+|---:|---:|---:|
+| 1 | 0.0200 | 0.0200 |
+| 1024 | 0.2200 | 20.4800 |
+
+The same script verifies exact max-min backups on a directed chain and undirected grid. It writes `exp/bmm_tabular_error_scaling.json`, `exp/bmm_tabular_error_scaling.md`, and `exp/bmm_tabular_error_scaling.png`.
+
+### 6.2 Logged-offset labels fail
 
 The first target used same-trajectory offset:
 
@@ -337,7 +348,7 @@ The first target used same-trajectory offset:
 
 This failed at high budgets. Diagnostics showed that the same JAX critic path could learn deterministic chains and overfit fixed PointMaze batches, but heldout PointMaze logged-offset labels were not identifiable at high budgets. kNN AUC was about 0.54 at \(H=256\) and 0.52 at \(H=512\). We concluded that logged offset is behavior time, not reliable reachability.
 
-### 6.2 Geodesic reachability labels work
+### 6.3 Geodesic reachability labels work
 
 PointMaze medium has 26 free cells and calibrated grid diameter about 217.75 steps. Therefore \(H=256\) and \(H=512\) are one-class under true geodesic reachability.
 
@@ -352,7 +363,7 @@ The state-only geodesic value critic learned clean budgeted reachability:
 
 The action-conditioned geodesic Q critic also passed cleanly, with AUCs from 0.9458 to 0.9784 on budgets \(32,64,96,128\), and with zero monotonicity violation.
 
-### 6.3 Q/V transitive is stable but not sufficient in abundant-label settings
+### 6.4 Q/V transitive is stable but not sufficient in abundant-label settings
 
 Q/V transitive consistency reduced Q-V-next discrepancy but did not improve abundant-label classification overall. For budgets \((40,80,160)\):
 
@@ -363,7 +374,7 @@ Q/V transitive consistency reduced Q-V-next discrepancy but did not improve abun
 
 This suggested that the right stress test was not abundant-label fitting, but parent-budget holdout.
 
-### 6.4 Budget-holdout gives the strongest positive result
+### 6.5 Budget-holdout gives the strongest positive result
 
 Grid-cell holdout trained budgets \((2,4)\) and held out parent \(8\). Across three seeds:
 
@@ -383,7 +394,20 @@ Env-step holdout trained budgets \((40,80)\) and held out parent \(160\). Across
 
 This is the strongest BMM-specific result: shorter-budget Q/V knowledge improves heldout longer-budget classification, and V-next distillation is much smaller.
 
-### 6.5 Dataset-support graph labels are learnable
+### 6.6 Max-min versus product transitive ablation
+
+A seed-0 grid-cell H8 ablation compared BMM max-min Q/V transitive consistency to a product-style Q/V target using the same witness sampler and lower-bound BCE protocol:
+
+| Comparison | Delta H8 AUC | Delta H8 Gap | Delta H8 BCE | Delta H8 ECE | Interpretation |
+|---|---:|---:|---:|---:|---|
+| B-A | +0.0175 | +0.0703 | -0.3365 | -0.0527 | max-min transitive over supervised only |
+| P-A | +0.0167 | +0.0649 | -0.3106 | -0.0467 | product transitive over supervised only |
+| B-P | +0.0008 | +0.0054 | -0.0259 | -0.0059 | max-min over product |
+| F-A | +0.0002 | +0.0014 | -0.0054 | -0.0008 | V-next control |
+
+This does not pause the paper, because product does not dominate max-min. However, it weakens the empirical distinction: in this clean H8 setting, product-style transitive learning captures most of the gain, while BMM is only slightly better.
+
+### 6.7 Dataset-support graph labels are learnable, but transfer is mixed
 
 A dataset-position graph built from observed transitions contained 1,698 nodes and 5,548 edges, with diameter 73 hops / 146 calibrated steps. Graph-label budget holdout was mildly positive:
 
@@ -393,9 +417,16 @@ A dataset-position graph built from observed transitions contained 1,698 nodes a
 | B Q/V transitive | 0.9849 | 0.3411 | 0.3277 | 0.8084 |
 | F V-next distill | 0.9780 | 0.3491 | 0.3265 | 0.7802 |
 
-This weakens the concern that BMM only works with grid-oracle labels, though the graph experiments remain diagnostic.
+The three-seed H120 graph replication was more mixed:
 
-### 6.6 Policy-facing results are weak
+| Comparison | Delta H120 AUC | Delta H120 Gap | Delta H120 BCE | Delta H120 ECE | Interpretation |
+|---|---:|---:|---:|---:|---|
+| B-A | +0.0043 | -0.0194 | +0.0224 | +0.0099 | small AUC gain, worse gap/BCE/ECE |
+| F-A | -0.0010 | +0.0035 | -0.0189 | -0.0056 | V-next control is small but improves BCE/ECE |
+
+This weakens the concern that BMM only works with grid-oracle labels, but the support-graph result should be framed as diagnostic feasibility rather than a strong empirical win.
+
+### 6.8 Policy-facing results are weak
 
 Flat action ranking did not improve. On the own-state action-ranking diagnostic:
 
@@ -521,6 +552,7 @@ BMM_TRL_CANDIDATE_ACTION_RESULTS_20260611_135918.md
 BMM_TRL_VALUE_SUBGOAL_NEXT_STEPS_RESULTS_20260611_163357.md
 BMM_TRL_VALUE_SUBGOAL_CONTROLLER_DECISION_20260611_170712.md
 BMM_TRL_HIERARCHICAL_PIVOT_QUICK_TRY_20260611_173408.md
+BMM_TRL_PAPER_EXPERIMENT_RESULTS_20260612_013139.md
 ```
 
 Implementation files:
@@ -532,6 +564,7 @@ utils/pointmaze_graph.py
 scripts/train_bmm_geodesic_value.py
 scripts/train_bmm_geodesic_q.py
 scripts/run_bmm_qv_budget_holdout.py
+scripts/summarize_bmm_paper_tables.py
 scripts/eval_bmm_action_ranking.py
 scripts/eval_bmm_joint_action_subgoal.py
 scripts/eval_bmm_value_subgoal_controller.py

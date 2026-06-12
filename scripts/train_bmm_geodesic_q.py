@@ -134,6 +134,12 @@ flags.DEFINE_enum(
     ["bce_equal", "prob_hinge", "bce_lower_bound"],
     "Q/V transitive loss: equality BCE or lower-bound consistency variants.",
 )
+flags.DEFINE_enum(
+    "qv_trans_target_type",
+    "max_min",
+    ["max_min", "product"],
+    "Q/V transitive target: BMM max-min or product-style control.",
+)
 flags.DEFINE_float(
     "qv_trans_bce_margin",
     0.0,
@@ -1173,6 +1179,7 @@ def qv_transitive_loss(
     grad_params,
     value_agent,
     qv_trans_loss_type,
+    qv_trans_target_type,
     qv_trans_bce_margin,
     qv_branch_mode,
     trans_budgets,
@@ -1226,7 +1233,14 @@ def qv_transitive_loss(
         )
         second_r = jax.nn.sigmoid(second_logits)
     witness_valids = jnp.asarray(batch["qv_valids"], dtype=first_r.dtype)
-    y_candidates = jnp.minimum(first_r, second_r)
+    min_candidates = jnp.minimum(first_r, second_r)
+    product_candidates = first_r * second_r
+    if qv_trans_target_type == "max_min":
+        y_candidates = min_candidates
+    elif qv_trans_target_type == "product":
+        y_candidates = product_candidates
+    else:
+        raise ValueError(f"Unsupported qv_trans_target_type={qv_trans_target_type}")
     y_candidates = jnp.where(witness_valids[None, ...] > 0, y_candidates, -1.0)
     y_trans = jax.lax.stop_gradient(jnp.max(y_candidates, axis=1))
     trans_valids = (witness_valids.max(axis=0) > 0).astype(parent_logits.dtype)
@@ -1261,6 +1275,8 @@ def qv_transitive_loss(
         qv_frac_y_trans_lt_parent=masked_mean(
             (target_minus_parent < 0.0).astype(parent_logits.dtype), trans_valids
         ),
+        qv_min_candidate_mean=masked_mean(min_candidates, witness_valids),
+        qv_product_candidate_mean=masked_mean(product_candidates, witness_valids),
         qv_first_q_mean=masked_mean(first_r, witness_valids),
         qv_second_v_mean=masked_mean(second_r, witness_valids),
         qv_valid_frac=trans_valids.mean(),
@@ -1311,6 +1327,12 @@ def qv_transitive_loss(
         info[f"qv_frac_y_trans_lt_parent_by_budget/{budget_key}"] = masked_mean(
             (target_minus_parent < 0.0).astype(parent_logits.dtype),
             parent_budget_mask,
+        )
+        info[f"qv_min_candidate_mean_by_budget/{budget_key}"] = masked_mean(
+            min_candidates, witness_budget_mask
+        )
+        info[f"qv_product_candidate_mean_by_budget/{budget_key}"] = masked_mean(
+            product_candidates, witness_budget_mask
         )
     return loss, info
 
@@ -1401,6 +1423,7 @@ def update_with_qv_trans(
     value_agent,
     lambda_qv_trans,
     qv_trans_loss_type="bce_equal",
+    qv_trans_target_type="max_min",
     qv_trans_bce_margin=0.0,
     lambda_vnext_distill=0.0,
     vnext_distill_loss_type="bce_equal",
@@ -1424,6 +1447,7 @@ def update_with_qv_trans(
                 grad_params,
                 value_agent,
                 qv_trans_loss_type,
+                qv_trans_target_type,
                 qv_trans_bce_margin,
                 qv_branch_mode,
                 trans_budgets,
@@ -1458,6 +1482,7 @@ update_with_qv_trans = jax.jit(
     update_with_qv_trans,
     static_argnames=(
         "qv_trans_loss_type",
+        "qv_trans_target_type",
         "vnext_distill_loss_type",
         "qv_branch_mode",
         "trans_budgets",
@@ -1742,6 +1767,7 @@ def summarize_qv_transitive_batch(batch, budgets):
         num_trans_witnesses=int(np.asarray(qv_valids).shape[0]),
         trans_witness_mode=str(FLAGS.trans_witness_mode),
         qv_branch_mode=str(FLAGS.qv_branch_mode),
+        qv_trans_target_type=str(FLAGS.qv_trans_target_type),
         budget_rows=rows,
     )
 
@@ -1756,6 +1782,7 @@ def print_qv_summary(summary, info):
         f"K={summary['num_trans_witnesses']} | "
         f"mode={summary['trans_witness_mode']} | "
         f"branch={summary['qv_branch_mode']} | "
+        f"target={summary['qv_trans_target_type']} | "
         f"loss={format_metric(info.get('critic/loss_qv_trans', np.nan))}"
     )
     print(
@@ -1871,6 +1898,7 @@ def main(_):
     print(f"  trans_budgets: {trans_budgets}")
     print(f"  lambda_qv_trans: {FLAGS.lambda_qv_trans}")
     print(f"  qv_trans_loss_type: {FLAGS.qv_trans_loss_type}")
+    print(f"  qv_trans_target_type: {FLAGS.qv_trans_target_type}")
     print(f"  qv_trans_bce_margin: {FLAGS.qv_trans_bce_margin}")
     print(f"  lambda_vnext_distill: {FLAGS.lambda_vnext_distill}")
     print(f"  vnext_distill_loss_type: {FLAGS.vnext_distill_loss_type}")
@@ -1961,6 +1989,7 @@ def main(_):
                 value_agent,
                 FLAGS.lambda_qv_trans,
                 qv_trans_loss_type=FLAGS.qv_trans_loss_type,
+                qv_trans_target_type=FLAGS.qv_trans_target_type,
                 qv_trans_bce_margin=FLAGS.qv_trans_bce_margin,
                 lambda_vnext_distill=FLAGS.lambda_vnext_distill,
                 vnext_distill_loss_type=FLAGS.vnext_distill_loss_type,
@@ -2022,6 +2051,7 @@ def main(_):
             final_loss_sup=final_loss,
             lambda_qv_trans=float(FLAGS.lambda_qv_trans),
             qv_trans_loss_type=str(FLAGS.qv_trans_loss_type),
+            qv_trans_target_type=str(FLAGS.qv_trans_target_type),
             qv_trans_bce_margin=float(FLAGS.qv_trans_bce_margin),
             lambda_vnext_distill=float(FLAGS.lambda_vnext_distill),
             vnext_distill_loss_type=str(FLAGS.vnext_distill_loss_type),

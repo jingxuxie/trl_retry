@@ -173,6 +173,8 @@ def main():
             "critic/qv_target_minus_parent_mean",
             "critic/qv_frac_y_trans_gt_parent",
             "critic/qv_frac_y_trans_lt_parent",
+            "critic/qv_min_candidate_mean",
+            "critic/qv_product_candidate_mean",
             "critic/qv_first_q_mean",
             "critic/qv_second_v_mean",
             "critic/qv_parent_oracle_label_mean",
@@ -186,6 +188,8 @@ def main():
             "critic/qv_target_minus_parent_mean_by_budget/H4",
             "critic/qv_frac_y_trans_gt_parent_by_budget/H4",
             "critic/qv_frac_y_trans_lt_parent_by_budget/H4",
+            "critic/qv_min_candidate_mean_by_budget/H4",
+            "critic/qv_product_candidate_mean_by_budget/H4",
             "critic/total_loss_with_qv",
             "critic/total_loss_with_aux",
         ):
@@ -206,6 +210,22 @@ def main():
         )
         assert "critic/loss_qv_trans" in info
         assert bool(jnp.all(jnp.isfinite(info["critic/loss_qv_trans"])))
+
+    agent, info = qdiag.update_with_qv_trans(
+        agent,
+        batch,
+        value_agent,
+        1.0,
+        qv_trans_loss_type="bce_lower_bound",
+        qv_trans_target_type="product",
+        qv_trans_bce_margin=0.0,
+        qv_branch_mode="learned_q_frozen_v",
+        trans_budgets=(4,),
+        budgets=(1, 2, 4),
+    )
+    assert "critic/loss_qv_trans" in info
+    assert bool(jnp.all(jnp.isfinite(info["critic/loss_qv_trans"])))
+    assert bool(jnp.all(info["critic/qv_product_candidate_mean"] <= 1.0))
 
     vnext_batch = gc_dataset.sample(action_config.batch_size)
     vnext_batch.update(

@@ -68,6 +68,7 @@ def make_report(path, seed, variant, lambda_qv_trans=0.0, lambda_vnext_distill=0
             "lambda_vnext_distill": lambda_vnext_distill,
             "qv_branch_mode": "learned_q_frozen_v",
             "qv_trans_loss_type": "bce_lower_bound",
+            "qv_trans_target_type": "max_min",
             "vnext_distill_loss_type": "bce_lower_bound",
         },
     }
@@ -82,6 +83,7 @@ def main():
         rows = [
             make_flat_row(0, "A_no_parent_no_trans", 8, 0.90, 0.50, 0.20),
             make_flat_row(0, "B_no_parent_qv_trans", 8, 0.93, 0.58, 0.16),
+            make_flat_row(0, "P_no_parent_product_qv", 8, 0.91, 0.54, 0.18),
             make_flat_row(0, "F_no_parent_vnext_distill", 8, 0.901, 0.501, 0.199),
         ]
         (finished / "summary.json").write_text(json.dumps(rows))
@@ -101,20 +103,25 @@ def main():
         )
 
         collected = summary.collect_rows([finished, interrupted], budget=8)
-        assert len(collected) == 5
+        assert len(collected) == 6
         aggregate, per_seed = summary.aggregate_comparisons(
-            collected, summary.parse_comparisons("B-A,F-A")
+            collected, summary.parse_comparisons("B-A,B-P,P-A,F-A")
         )
         assert aggregate[0]["comparison"] == "B-A"
         assert aggregate[0]["num_seeds"] == 2
         assert aggregate[0]["mean_delta_auc"] > 0.0
         assert aggregate[0]["mean_delta_gap"] > 0.0
         assert aggregate[0]["mean_delta_q_v_next_abs_diff"] < 0.0
-        assert aggregate[1]["comparison"] == "F-A"
+        assert aggregate[1]["comparison"] == "B-P"
         assert aggregate[1]["num_seeds"] == 1
-        assert len(per_seed) == 3
+        assert aggregate[2]["comparison"] == "P-A"
+        assert aggregate[2]["num_seeds"] == 1
+        assert aggregate[3]["comparison"] == "F-A"
+        assert aggregate[3]["num_seeds"] == 1
+        assert len(per_seed) == 5
         text = summary.markdown_table(aggregate, per_seed, budget=8)
         assert "no-parent BMM effect" in text
+        assert "max-min versus product transitive effect" in text
         assert "V-next distill control" in text
         text_160 = summary.markdown_table(aggregate, per_seed, budget=160)
         assert "delta H160 AUC" in text_160

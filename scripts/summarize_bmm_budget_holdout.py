@@ -25,6 +25,7 @@ RUN_RE = re.compile(
 VARIANT_NAMES = {
     "A": "A_no_parent_no_trans",
     "B": "B_no_parent_qv_trans",
+    "P": "P_no_parent_product_qv",
     "C": "C_few_parent_no_trans",
     "D": "D_few_parent_qv_trans",
     "E": "E_full_supervised_upper",
@@ -34,6 +35,8 @@ VARIANT_NAMES = {
 
 COMPARISON_LABELS = {
     "B-A": "no-parent BMM effect",
+    "P-A": "no-parent product transitive effect",
+    "B-P": "max-min versus product transitive effect",
     "D-C": "few-parent BMM effect",
     "F-A": "V-next distill control",
     "G-B": "oracle branch control",
@@ -138,6 +141,7 @@ def spec_from_report_path(report_path, report):
         lambda_vnext_distill=float(config.get("lambda_vnext_distill", 0.0)),
         qv_branch_mode=str(config.get("qv_branch_mode", "learned_q_frozen_v")),
         qv_trans_loss_type=str(config.get("qv_trans_loss_type", "bce_lower_bound")),
+        qv_trans_target_type=str(config.get("qv_trans_target_type", "max_min")),
         vnext_distill_loss_type=str(config.get("vnext_distill_loss_type", "bce_lower_bound")),
     )
 

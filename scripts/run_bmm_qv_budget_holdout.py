@@ -43,6 +43,7 @@ def build_run_specs(args):
                     lambda_vnext_distill=0.0,
                     qv_branch_mode="learned_q_frozen_v",
                     qv_trans_loss_type=args.qv_trans_loss_type,
+                    qv_trans_target_type=args.qv_trans_target_type,
                     vnext_distill_loss_type=args.vnext_distill_loss_type,
                 ),
                 dict(
@@ -54,6 +55,19 @@ def build_run_specs(args):
                     lambda_vnext_distill=0.0,
                     qv_branch_mode="learned_q_frozen_v",
                     qv_trans_loss_type=args.qv_trans_loss_type,
+                    qv_trans_target_type=args.qv_trans_target_type,
+                    vnext_distill_loss_type=args.vnext_distill_loss_type,
+                ),
+                dict(
+                    variant="P_no_parent_product_qv",
+                    seed=seed,
+                    supervised_budgets=supervised_budgets,
+                    parent_label_pairs=0,
+                    lambda_qv_trans=args.qv_lambda,
+                    lambda_vnext_distill=0.0,
+                    qv_branch_mode="learned_q_frozen_v",
+                    qv_trans_loss_type=args.qv_trans_loss_type,
+                    qv_trans_target_type="product",
                     vnext_distill_loss_type=args.vnext_distill_loss_type,
                 ),
                 dict(
@@ -65,6 +79,7 @@ def build_run_specs(args):
                     lambda_vnext_distill=0.0,
                     qv_branch_mode="learned_q_frozen_v",
                     qv_trans_loss_type=args.qv_trans_loss_type,
+                    qv_trans_target_type=args.qv_trans_target_type,
                     vnext_distill_loss_type=args.vnext_distill_loss_type,
                 ),
                 dict(
@@ -76,6 +91,7 @@ def build_run_specs(args):
                     lambda_vnext_distill=0.0,
                     qv_branch_mode="learned_q_frozen_v",
                     qv_trans_loss_type=args.qv_trans_loss_type,
+                    qv_trans_target_type=args.qv_trans_target_type,
                     vnext_distill_loss_type=args.vnext_distill_loss_type,
                 ),
                 dict(
@@ -87,6 +103,7 @@ def build_run_specs(args):
                     lambda_vnext_distill=0.0,
                     qv_branch_mode="learned_q_frozen_v",
                     qv_trans_loss_type=args.qv_trans_loss_type,
+                    qv_trans_target_type=args.qv_trans_target_type,
                     vnext_distill_loss_type=args.vnext_distill_loss_type,
                 ),
                 dict(
@@ -98,6 +115,7 @@ def build_run_specs(args):
                     lambda_vnext_distill=args.vnext_lambda,
                     qv_branch_mode="learned_q_frozen_v",
                     qv_trans_loss_type=args.qv_trans_loss_type,
+                    qv_trans_target_type=args.qv_trans_target_type,
                     vnext_distill_loss_type=args.vnext_distill_loss_type,
                 ),
                 dict(
@@ -109,6 +127,7 @@ def build_run_specs(args):
                     lambda_vnext_distill=0.0,
                     qv_branch_mode=args.oracle_branch_mode,
                     qv_trans_loss_type=args.qv_trans_loss_type,
+                    qv_trans_target_type=args.qv_trans_target_type,
                     vnext_distill_loss_type=args.vnext_distill_loss_type,
                 ),
             ]
@@ -165,6 +184,7 @@ def train_command(args, spec, output_json, save_dir=None):
         f"--eval_interval={args.eval_interval}",
         f"--lambda_qv_trans={spec['lambda_qv_trans']}",
         f"--qv_trans_loss_type={spec['qv_trans_loss_type']}",
+        f"--qv_trans_target_type={spec['qv_trans_target_type']}",
         f"--qv_trans_bce_margin={args.qv_trans_bce_margin}",
         f"--lambda_vnext_distill={spec['lambda_vnext_distill']}",
         f"--vnext_distill_loss_type={spec['vnext_distill_loss_type']}",
@@ -241,6 +261,7 @@ def summarize_report(report_path, spec, trans_budgets):
                 lambda_vnext_distill=float(spec["lambda_vnext_distill"]),
                 qv_branch_mode=str(spec["qv_branch_mode"]),
                 qv_trans_loss_type=str(spec["qv_trans_loss_type"]),
+                qv_trans_target_type=str(spec.get("qv_trans_target_type", "max_min")),
                 vnext_distill_loss_type=str(spec["vnext_distill_loss_type"]),
                 budget=budget,
                 is_trans_parent_budget=budget in trans_budget_set,
@@ -292,6 +313,14 @@ def summarize_report(report_path, spec, trans_budgets):
                 ),
                 loss_qv_trans_by_budget=info.get(
                     f"critic/loss_qv_trans_by_budget/{budget_key}", float("nan")
+                ),
+                qv_min_candidate_mean=info.get(
+                    f"critic/qv_min_candidate_mean_by_budget/{budget_key}",
+                    float("nan"),
+                ),
+                qv_product_candidate_mean=info.get(
+                    f"critic/qv_product_candidate_mean_by_budget/{budget_key}",
+                    float("nan"),
                 ),
                 loss_vnext_distill_by_budget=info.get(
                     f"critic/loss_vnext_distill_by_budget/{budget_key}", float("nan")
@@ -355,6 +384,12 @@ def parse_args(argv):
     parser.add_argument("--qv_lambda", type=float, default=0.01)
     parser.add_argument("--vnext_lambda", type=float, default=0.01)
     parser.add_argument("--qv_trans_loss_type", default="bce_lower_bound")
+    parser.add_argument(
+        "--qv_trans_target_type",
+        default="max_min",
+        choices=("max_min", "product"),
+        help="Target type for non-product Q/V variants; P always uses product.",
+    )
     parser.add_argument("--qv_trans_bce_margin", default="0.0")
     parser.add_argument("--vnext_distill_loss_type", default="bce_lower_bound")
     parser.add_argument("--vnext_distill_bce_margin", default="0.0")
