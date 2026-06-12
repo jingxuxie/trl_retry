@@ -41,12 +41,20 @@ DEFAULT_HOLDOUTS = (
         / "aggregate_h120_all_seeds.json",
     ),
     (
-        "product ablation H8",
+        "product ablation grid-cell H8",
         8,
         REPO_ROOT
         / "exp"
-        / "bmm_product_vs_maxmin_grid_h8_seed0"
-        / "aggregate_with_seed0_baselines.json",
+        / "bmm_product_vs_maxmin_grid_h8_seeds12"
+        / "aggregate_h8_all_product_seeds.json",
+    ),
+    (
+        "product ablation env-step H160",
+        160,
+        REPO_ROOT
+        / "exp"
+        / "bmm_product_vs_maxmin_env_h160_seed0"
+        / "aggregate_h160_seed0_product.json",
     ),
 )
 

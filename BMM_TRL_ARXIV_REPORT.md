@@ -336,7 +336,7 @@ The tabular sanity check now emits an error-scaling artifact for the core algebr
 | 1 | 0.0200 | 0.0200 |
 | 1024 | 0.2200 | 20.4800 |
 
-The same script verifies exact max-min backups on a directed chain and undirected grid. It writes `exp/bmm_tabular_error_scaling.json`, `exp/bmm_tabular_error_scaling.md`, and `exp/bmm_tabular_error_scaling.png`.
+The same script verifies exact max-min backups on a directed chain and undirected grid. It writes `exp/bmm_tabular_error_scaling.json`, `exp/bmm_tabular_error_scaling.md`, and `exp/bmm_tabular_error_scaling.png`; a tracked copy of the figure is available at `assets/bmm_tabular_error_scaling.png`.
 
 ### 6.2 Logged-offset labels fail
 
@@ -396,16 +396,25 @@ This is the strongest BMM-specific result: shorter-budget Q/V knowledge improves
 
 ### 6.6 Max-min versus product transitive ablation
 
-A seed-0 grid-cell H8 ablation compared BMM max-min Q/V transitive consistency to a product-style Q/V target using the same witness sampler and lower-bound BCE protocol:
+A grid-cell H8 ablation compared BMM max-min Q/V transitive consistency to a product-style Q/V target using the same witness sampler and lower-bound BCE protocol. Across three seeds:
 
 | Comparison | Delta H8 AUC | Delta H8 Gap | Delta H8 BCE | Delta H8 ECE | Interpretation |
 |---|---:|---:|---:|---:|---|
-| B-A | +0.0175 | +0.0703 | -0.3365 | -0.0527 | max-min transitive over supervised only |
-| P-A | +0.0167 | +0.0649 | -0.3106 | -0.0467 | product transitive over supervised only |
-| B-P | +0.0008 | +0.0054 | -0.0259 | -0.0059 | max-min over product |
-| F-A | +0.0002 | +0.0014 | -0.0054 | -0.0008 | V-next control |
+| B-A | +0.0150 | +0.0751 | -0.3609 | -0.0575 | max-min transitive over supervised only |
+| P-A | +0.0139 | +0.0702 | -0.3344 | -0.0518 | product transitive over supervised only |
+| B-P | +0.0011 | +0.0050 | -0.0265 | -0.0057 | max-min over product |
+| F-A | +0.0002 | +0.0017 | -0.0063 | -0.0010 | V-next control |
 
-This does not pause the paper, because product does not dominate max-min. However, it weakens the empirical distinction: in this clean H8 setting, product-style transitive learning captures most of the gain, while BMM is only slightly better.
+An optional env-step H160 product-control run on seed 0 showed the same pattern:
+
+| Comparison | Delta H160 AUC | Delta H160 Gap | Delta H160 BCE | Delta H160 ECE | Interpretation |
+|---|---:|---:|---:|---:|---|
+| B-A | +0.0400 | +0.0640 | -0.5976 | -0.0398 | max-min transitive over supervised only |
+| P-A | +0.0345 | +0.0517 | -0.5166 | -0.0316 | product transitive over supervised only |
+| B-P | +0.0055 | +0.0122 | -0.0810 | -0.0083 | max-min over product |
+| F-A | +0.0035 | +0.0067 | -0.0774 | -0.0038 | V-next control |
+
+This does not pause the paper, because product does not dominate max-min in these diagnostics. However, it weakens the empirical distinction: product-style transitive learning captures most of the gain, while BMM is consistently but only slightly better. The safe claim is that max-min is theoretically cleaner and empirically competitive or mildly better here, not that it decisively dominates product.
 
 ### 6.7 Dataset-support graph labels are learnable, but transfer is mixed
 
@@ -553,6 +562,7 @@ BMM_TRL_VALUE_SUBGOAL_NEXT_STEPS_RESULTS_20260611_163357.md
 BMM_TRL_VALUE_SUBGOAL_CONTROLLER_DECISION_20260611_170712.md
 BMM_TRL_HIERARCHICAL_PIVOT_QUICK_TRY_20260611_173408.md
 BMM_TRL_PAPER_EXPERIMENT_RESULTS_20260612_013139.md
+BMM_TRL_FINAL_PAPER_CONTROL_RESULTS_20260612_020718.md
 ```
 
 Implementation files:
@@ -571,4 +581,5 @@ scripts/eval_bmm_value_subgoal_controller.py
 scripts/eval_bmm_value_subgoal_policy_smoke.py
 scripts/eval_bmm_graph_value_subgoal.py
 scripts/eval_bmm_subgoal_bc_controller.py
+assets/bmm_tabular_error_scaling.png
 ```
