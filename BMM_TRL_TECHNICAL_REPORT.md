@@ -1,94 +1,145 @@
-# BMM-TRL Technical Report: Budgeted Max-Min Transitive RL for Offline Goal-Conditioned RL
+# BMM-TRL: Budgeted Max-Min Transitive RL for Offline Goal-Conditioned RL
 
-Date: 2026-06-11
+Date: 2026-06-11  
+Status: archival technical report / preliminary research note
 
-Repository context: this report summarizes the BMM-TRL prototype implemented in this repository and the diagnostics recorded in the `BMM_TRL_*.md` result files.
+This report summarizes the motivation, theory, algorithm, and experimental findings from the BMM-TRL prototype in this repository. It is written as an archive-facing technical note rather than an advisor handoff. The goal is to make the research story clear: what problem we tried to solve, what mathematical property the proposed method targets, what worked empirically, what did not work, and which future directions remain plausible.
+
+---
 
 ## Abstract
 
-This project investigated **Budgeted Max-Min Transitive RL (BMM-TRL)**, a proposed variant of Transitive RL designed to reduce long-horizon error compounding. The motivating observation is that TRL's product backup is additive in distance/log-value space, so approximation bias can still compound additively along both branches of a recursive decomposition. BMM-TRL instead learns a **budgeted reachability predicate** and composes values with a **max-min backup**:
+Transitive RL (TRL) uses a divide-and-conquer value backup for offline goal-conditioned reinforcement learning. In deterministic goal-reaching problems, discounted values can be written as `V*(s,g)=gamma^{d*(s,g)}`, and TRL composes two subproblems with a product backup. This gives a shallow recursive dependency graph, but in log-value or distance space the product backup is still additive. Thus, worst-case approximation bias in the distance estimate can compound as
 
 ```text
-R_H(s,g) = 1[d(s,g) <= H]
-R_H(s,g) <- max_w min(R_h(s,w), R_{H-h}(w,g))
+E(T) <= 2 E(T/2) + epsilon,
 ```
 
-Because `max` and `min` are non-expansive in sup norm, the ideal balanced recursion satisfies an error recurrence of the form
+which remains linear in horizon under uniform residuals.
+
+We investigated **Budgeted Max-Min Transitive RL (BMM-TRL)**, which replaces discounted distance values with finite-budget reachability predicates:
+
+```text
+R_H(s,g) = 1[d(s,g) <= H].
+```
+
+The associated transitive backup is
+
+```text
+R_H(s,g) <- max_w min(R_h(s,w), R_{H-h}(w,g)).
+```
+
+Because `max` and `min` are non-expansive in sup norm, the ideal balanced recursion has an error recurrence
 
 ```text
 E(H) <= epsilon_H + max(E(h), E(H-h)),
 ```
 
-which gives `O(epsilon log H)` accumulation under uniform residuals and dyadic/balanced budgets. This is the central mathematical motivation.
+which yields `O(epsilon log H)` accumulated score error for dyadic balanced budgets. This is the main theoretical motivation.
 
-The empirical work found a clear split:
-
-- **Positive:** BMM-style budgeted reachability works as a critic/subgoal diagnostic. It learns clean geodesic and support-graph reachability labels, and Q/V max-min transitive consistency improves heldout long-budget classification in budget-holdout settings.
-- **Negative:** The current prototype did not produce a robust policy improvement path. Flat Q action ranking, Q/V joint action-subgoal extraction, and lightweight hierarchical controller experiments were weak or inconclusive.
-
-The current recommended conclusion is: **pause active policy-facing experimentation**, but preserve the project as a critic/reachability/subgoal-planning result or as a possible future hierarchical RL project with a stronger low-level controller.
+The project produced a clear empirical split. On clean deterministic or support-reachability targets, the BMM critic learns well and Q/V max-min transitive consistency improves heldout long-budget reachability in budget-holdout diagnostics. However, the current prototype did not translate these critic-level gains into robust policy improvement. Flat action ranking, Q/V joint action-subgoal extraction, and lightweight hierarchical control remained weak or inconclusive. The most defensible current conclusion is that BMM-TRL is promising as a **budgeted reachability and subgoal-planning diagnostic**, but not yet as an end-to-end long-horizon offline RL policy algorithm.
 
 ---
 
-## 1. Motivation
+## 1. Background and related work
 
-### 1.1 The original TRL composition
+### 1.1 Goal-conditioned RL and offline GCRL
 
-TRL learns a discounted temporal-distance value of the form
+Goal-conditioned reinforcement learning (GCRL) studies policies and value functions conditioned on a goal. Universal Value Function Approximators (UVFAs) introduced the idea of learning value functions that generalize across goals and tasks by conditioning the approximator on the goal representation [Schaul et al., 2015]. Hindsight Experience Replay (HER) made sparse goal-reaching RL more practical by relabeling failed trajectories with goals that were actually achieved [Andrychowicz et al., 2017].
 
-```text
-V*(s,g) = gamma^{d*(s,g)}
-```
+In offline GCRL, the agent must learn from a fixed reward-free dataset. This setting is attractive because unlabeled trajectories can in principle specify many goal-reaching tasks, but it is difficult because the agent must reason about long-horizon stitching and avoid out-of-support actions. OGBench was introduced to benchmark offline GCRL algorithms across many environments and specifically probe stitching, long-horizon reasoning, high-dimensional observations, and stochasticity [Park et al., 2024].
 
-and uses a transitive product backup:
+### 1.2 Hierarchical offline GCRL
+
+Long-horizon GCRL naturally suggests subgoal decomposition. HIQL learns a hierarchy in which a high-level policy chooses latent subgoals and a low-level policy reaches those subgoals, motivated by the fact that accurate value estimation is easier for nearby goals than faraway goals [Park et al., 2023]. This perspective is closely related to the final empirical conclusion of this project: BMM's max-min structure appears more natural as a high-level reachability/subgoal-planning mechanism than as a flat one-step action scorer.
+
+### 1.3 Transitive RL
+
+Transitive RL (TRL) proposes a divide-and-conquer value learning rule for offline GCRL. In deterministic goal-reaching, if `d*(s,g)` is a shortest-path distance and `V*(s,g)=gamma^{d*(s,g)}`, then the triangle inequality induces a transitive product backup:
 
 ```text
 V(s,g) <- max_w V(s,w) V(w,g).
 ```
 
-In distance space this is a min-plus composition:
+TRL's central empirical claim is that divide-and-conquer recursions can help long-horizon value learning by reducing recursion depth compared with one-step temporal-difference backups [Park et al., 2025]. The starting observation for BMM-TRL is that the product backup corresponds to addition in distance/log-value space:
 
 ```text
 d(s,g) <- min_w d(s,w) + d(w,g).
 ```
 
-This can reduce the dependency depth of a long-horizon problem, but the numeric error in distance/log-value space still composes additively. If both branches have worst-case error `E(H/2)` and the parent regression has residual `epsilon`, then the worst-case distance-space recurrence is
+Thus, although the dependency depth is logarithmic under balanced decomposition, worst-case distance-bias accumulation is still additive across branches. BMM-TRL was designed to change the algebra so that branch errors compose by `max` rather than `sum`.
 
-```text
-E(H) <= 2 E(H/2) + epsilon,
-```
+### 1.4 Offline RL constraints
 
-which is linear in horizon under uniform per-level residuals.
-
-### 1.2 Desired property
-
-The goal of this project was to construct a value object whose recursive composition has a max-error recurrence:
-
-```text
-E(H) <= epsilon + max(E(h), E(H-h)).
-```
-
-A natural object with this property is **budgeted reachability**:
-
-```text
-R_H(s,g) = 1[d*(s,g) <= H].
-```
-
-The corresponding transitive operator is
-
-```text
-T_H(R)(s,g) = max_w min(R_h(s,w), R_{H-h}(w,g)).
-```
-
-The `max-min` operator is the core of BMM-TRL.
+Offline RL methods such as IQL emphasize that value learning from static datasets must avoid evaluating out-of-distribution actions or relying on unsupported policy improvement steps [Kostrikov et al., 2021]. This concern is important for BMM-TRL as well. A reachability target constructed from offline data should not claim true environment reachability outside the data support. The general offline target should instead be **support reachability** over a conservative graph induced by the dataset.
 
 ---
 
-## 2. Deterministic theory
+## 2. Motivation: from additive distance error to max-min reachability error
 
-We first state the clean deterministic result. Let `M` be a deterministic controllable graph or deterministic MDP with shortest-path distance `d*(s,g)`.
+### 2.1 Product TRL is additive in distance space
 
-Define the state reachability predicate:
+Suppose TRL estimates discounted temporal-distance values
+
+```text
+V*(s,g) = gamma^{d*(s,g)}.
+```
+
+A product backup has the form
+
+```text
+V(s,g) = max_w V(s,w)V(w,g).
+```
+
+Taking negative log base `gamma` transforms this into the min-plus distance backup
+
+```text
+d(s,g) = min_w d(s,w) + d(w,g).
+```
+
+If the two branch distance estimates have worst-case errors `E(h)` and `E(H-h)`, then the parent distance error can be bounded as
+
+```text
+E(H) <= epsilon_H + E(h) + E(H-h).
+```
+
+For equal splits, this becomes
+
+```text
+E(H) <= epsilon_H + 2E(H/2),
+```
+
+which is linear in `H` under uniform residuals. This is the core concern that motivated BMM-TRL.
+
+### 2.2 Desired recurrence
+
+We wanted a learned object whose recursion satisfies
+
+```text
+E(H) <= epsilon_H + max(E(h), E(H-h)).
+```
+
+For dyadic balanced splits, this gives
+
+```text
+E(2^k) <= sum_{i=1}^k epsilon_i,
+```
+
+and if `epsilon_i <= epsilon`,
+
+```text
+E(H) <= epsilon log_2 H.
+```
+
+A budgeted reachability predicate has exactly the right algebra.
+
+---
+
+## 3. Deterministic BMM theory
+
+Let the environment be a deterministic graph or deterministic MDP, and let `d*(s,g)` be the shortest-path distance from state `s` to goal `g`.
+
+Define the state reachability predicate
 
 ```text
 V_H*(s,g) = 1[d*(s,g) <= H].
@@ -100,45 +151,50 @@ For an action-conditioned critic with deterministic transition `s' = f(s,a)`, de
 Q_H*(s,a,g) = 1[d*(f(s,a),g) <= H - 1].
 ```
 
-### Proposition 1: Exact deterministic max-min identity
+### Proposition 1: exact deterministic max-min identity
 
-For any split `h in {0,...,H}` and allowing endpoint witnesses, the state reachability predicate satisfies
+For any split `h in {0,...,H}`, allowing endpoint witnesses,
 
 ```text
 V_H*(s,g) = max_w min(V_h*(s,w), V_{H-h}*(w,g)).
 ```
 
-The action-conditioned version satisfies
+The action-conditioned identity is
 
 ```text
 Q_H*(s,a,g) = max_w min(Q_h*(s,a,w), V_{H-h}*(w,g)).
 ```
 
-#### Proof sketch
+#### Proof
 
-If `V_H*(s,g)=1`, then there is a path from `s` to `g` of length `L <= H`. Choose a witness `w` along the path after `min(h,L)` steps. Then
-
-```text
-d*(s,w) <= h,
-d*(w,g) <= H-h,
-```
-
-so both branch predicates are one and the max-min value is one.
-
-Conversely, if the max-min value is one, then there exists a witness `w` such that
+If `V_H*(s,g)=1`, there exists a path from `s` to `g` of length `L <= H`. Choose a witness `w` on that path after at most `h` steps. The remaining suffix to `g` has length at most `H-h`, so
 
 ```text
 d*(s,w) <= h,
 d*(w,g) <= H-h.
 ```
 
-Concatenating the two paths gives a path from `s` to `g` of length at most `H`, so `V_H*(s,g)=1`.
+Thus both branch predicates equal one and the max-min value is one.
 
-The Q identity follows by applying the same argument after taking action `a` and moving to `f(s,a)`.
+Conversely, if the max-min value is one, then there exists `w` such that
 
-### Proposition 2: Non-expansive error propagation
+```text
+V_h*(s,w)=1,
+V_{H-h}*(w,g)=1.
+```
 
-Let estimates `V_hat_h` and `V_hat_{H-h}` satisfy
+Therefore
+
+```text
+d*(s,w) <= h,
+d*(w,g) <= H-h.
+```
+
+Concatenating the two paths gives a path from `s` to `g` of length at most `H`, so `V_H*(s,g)=1`. The Q identity follows by applying the same argument after the first action transition `f(s,a)`.
+
+### Proposition 2: non-expansive error propagation
+
+Let estimates satisfy
 
 ```text
 ||V_hat_h - V_h*||_infty <= E_h,
@@ -158,7 +214,7 @@ Then
 ||T_hat_H - T*_H||_infty <= max(E_h, E_{H-h}).
 ```
 
-#### Proof sketch
+#### Proof
 
 For scalars, `min` is 1-Lipschitz under the max norm:
 
@@ -166,49 +222,33 @@ For scalars, `min` is 1-Lipschitz under the max norm:
 |min(a,b) - min(a',b')| <= max(|a-a'|, |b-b'|).
 ```
 
-The `max_w` operation is also 1-Lipschitz in sup norm:
+The outer `max_w` is also 1-Lipschitz:
 
 ```text
 |max_w z_w - max_w z'_w| <= sup_w |z_w - z'_w|.
 ```
 
-Combining these two inequalities gives the bound.
+Combining these two inequalities yields the bound.
 
-If the function class projection/regression step adds residual `epsilon_H`, then
+If the function approximation or regression step introduces a projection residual `epsilon_H`, then
 
 ```text
 E_H <= epsilon_H + max(E_h, E_{H-h}).
 ```
 
-For balanced dyadic splits `H=2^k` and uniform residual `epsilon`, this yields
+For balanced dyadic splits `H=2^k` and uniform residual `epsilon`,
 
 ```text
 E_H <= k epsilon = O(epsilon log H).
 ```
 
-This is the main theoretical motivation for BMM-TRL.
-
-### Contrast with distance-space composition
-
-For additive distance composition,
-
-```text
-d_H(s,g) = min_w d_h(s,w) + d_{H-h}(w,g),
-```
-
-branch errors add:
-
-```text
-E_H <= epsilon_H + E_h + E_{H-h}.
-```
-
-For equal splits, this recurrence is linear in horizon under uniform residuals. This is the gap BMM-TRL was designed to address.
+This is the theoretical property BMM-TRL was designed to test.
 
 ---
 
-## 3. Stochastic environments
+## 4. Stochastic environments
 
-The stochastic case is more subtle. Exact finite-horizon success probability does **not** obey a max-min identity in general.
+The deterministic theory does not automatically extend to true finite-horizon success probability.
 
 Let
 
@@ -216,67 +256,59 @@ Let
 P_H*(s,g) = sup_pi Pr_pi[tau_g <= H | s_0=s].
 ```
 
-If a policy first tries to reach `w` within `h` steps with probability `p`, and then tries to reach `g` from `w` within `H-h` steps with probability `q`, the two-stage success probability is approximately lower-bounded by `p q`, not by `min(p,q)`. Therefore an exact stochastic-probability Bellman equation is not the deterministic max-min operator.
+In a stochastic environment, a two-stage policy that first reaches `w` with probability `p` and then reaches `g` from `w` with probability `q` has a success probability related to `p q`, not `min(p,q)`. Thus, the max-min operator is not an exact Bellman equation for arbitrary stochastic success probabilities.
 
-BMM-TRL can still be extended to stochastic environments in two principled ways.
+There are two principled interpretations where BMM remains meaningful.
 
-### 3.1 Support reachability
+### 4.1 Support reachability
 
-Define a support graph from the stochastic MDP:
+Define a support graph by adding an edge `s -> s'` when there exists a supported action `a` such that
 
 ```text
-s -> s' is an edge if there exists a supported action a with P(s'|s,a) > 0.
+P(s' | s,a) > 0.
 ```
 
 Then define support reachability:
 
 ```text
-S_H(s,g) = 1[there exists a positive-probability supported path from s to g of length <= H].
+S_H(s,g) = 1[there exists a supported path from s to g of length <= H].
 ```
 
-This is exactly deterministic graph reachability on the support graph. Therefore the deterministic max-min identity and non-expansive error result apply directly.
+This is ordinary graph reachability. The deterministic max-min identity and non-expansive error recurrence apply exactly. This is the most relevant interpretation for offline RL, where unsupported transitions cannot be trusted.
 
-This is the most relevant stochastic interpretation for offline RL when only dataset support is observable.
-
-### 3.2 Reliability-threshold reachability
-
-For success probability targets, a conservative thresholded extension is possible. Let `rho = exp(-b)` be a required reliability threshold and define
-
-```text
-Z_{H,b}(s,g) = 1[P_H*(s,g) >= exp(-b)].
-```
-
-A two-stage sufficient condition is:
-
-```text
-P_h(s,w) >= exp(-b1),
-P_{H-h}(w,g) >= exp(-b2)
-=> P_H(s,g) >= exp(-(b1+b2))
-```
-
-under the usual Markov restart/two-stage policy interpretation. Thus a sound conservative recurrence is
-
-```text
-Z_{H,b}(s,g) >= max_w min(Z_{h,b/2}(s,w), Z_{H-h,b/2}(w,g)).
-```
-
-This preserves the max-min non-expansive structure, but it is only a sufficient lower-bound target and requires an additional reliability-budget dimension. This was not implemented in the current prototype.
-
-### 3.3 What the current project actually implements
-
-The current implementation should be viewed as deterministic/support-reachability BMM, not full stochastic success-probability BMM. For general offline RL, the correct target is not true environment reachability and not same-trajectory offset, but **offline support graph reachability**:
+In a dataset setting, we instantiate this as
 
 ```text
 R_H^D(s,g) = 1[d_D(phi(s), phi(g)) <= H],
 ```
 
-where `d_D` is shortest-path distance in a graph built from offline trajectories. The experiments started with grid/geodesic targets as oracle diagnostics and later tested dataset-support graph targets.
+where `d_D` is the shortest-path distance in a conservative graph built from offline trajectories and `phi` is the state or learned representation.
+
+### 4.2 Reliability-threshold reachability
+
+For stochastic success probabilities, one conservative extension is to threshold probability at a reliability budget. Let `rho = exp(-b)` and define
+
+```text
+Z_{H,b}(s,g) = 1[P_H*(s,g) >= exp(-b)].
+```
+
+If a branch to `w` succeeds with probability at least `exp(-b1)` and a branch from `w` to `g` succeeds with probability at least `exp(-b2)`, then a two-stage policy has success probability at least `exp(-(b1+b2))` under the usual Markov policy-switching interpretation. Thus,
+
+```text
+Z_{H,b}(s,g) >= max_w min(Z_{h,b1}(s,w), Z_{H-h,b2}(w,g))
+```
+
+for `b=b1+b2`. This preserves the non-expansive max-min form but is a conservative lower-bound target, not an equality. It also requires tracking a reliability budget in addition to the time budget. This extension was not implemented in the current prototype.
+
+### 4.3 Practical implication
+
+The implemented method should be viewed as BMM for deterministic or support-reachability targets, not as an exact stochastic-probability Bellman method. This distinction is important for future work.
 
 ---
 
-## 4. Algorithm: BMM-TRL
+## 5. Algorithm
 
-### 4.1 Critic parameterization
+### 5.1 Parameterization
 
 The prototype keeps the TRL-style action-conditioned critic:
 
@@ -284,46 +316,43 @@ The prototype keeps the TRL-style action-conditioned critic:
 R_theta(s,a,g,H) = sigmoid(f_theta(s,a,g,H)).
 ```
 
-The first implementation appends a normalized budget feature to the goal input:
+The budget `H` is appended to the goal input through a normalized log-budget feature:
 
 ```text
 budget_feature = log2(H) / log2(max_budget).
 ```
 
-Later diagnostics also used budget sets such as env-step budgets `(40,80,160)` and grid-cell budgets `(2,4,8)`.
-
-### 4.2 Supervised labels
-
-The final clean labels used in successful diagnostics were:
-
-State value labels:
+The state-only value version is obtained by dropping actions:
 
 ```text
-V_H(s,g) = 1[d(s,g) <= H].
+V_theta(s,g,H).
 ```
 
-Action-conditioned labels:
+### 5.2 Direct supervised labels
+
+The clean labels used after the initial logged-offset failure were:
 
 ```text
-Q_H(s_t,a_t,g) = 1[d(s_{t+1},g) <= H - 1].
+V_H(s,g) = 1[d(s,g) <= H]
+Q_H(s_t,a_t,g) = 1[d(s_{t+1},g) <= H-1].
 ```
 
-The distance `d` was instantiated as either:
+The distance `d` was instantiated as:
 
-1. layout/grid geodesic distance, for oracle diagnostics;
-2. dataset-position graph distance, for offline-support diagnostics.
+1. layout/grid geodesic distance, used as an oracle diagnostic; and
+2. dataset-position graph distance, used as an offline-support diagnostic.
 
-### 4.3 Q/V transitive target
+### 5.3 Q/V transitive target
 
-The policy-relevant transitive target uses an action-conditioned first branch and a state-value second branch:
+The main action-conditioned transitive target is
 
 ```text
 y_QV = max_w min(Q_h(s,a,w), V_{H-h}(w,g)).
 ```
 
-A frozen state-value teacher was used for the second branch in the main Q/V diagnostics.
+In the main experiments, the second branch `V_{H-h}` came from a frozen state-value teacher. This separated Q learning from simultaneous V instability.
 
-Because sampled witnesses give a lower-bound target rather than an equality target, the most sensible loss mode was a lower-bound BCE or hinge. The default used in later experiments was:
+Because sampled witnesses produce a lower-bound target rather than an exact equality target, later experiments used a lower-bound loss. The default later configuration was
 
 ```text
 qv_trans_loss_type = bce_lower_bound
@@ -332,45 +361,40 @@ num_trans_witnesses = 4
 trans_witness_mode = slack_balanced
 ```
 
-### 4.4 Budget-holdout protocol
+### 5.4 Budget-holdout protocol
 
 The most important diagnostic protocol was budget holdout:
 
 ```text
-Train short budgets: H_short1, H_short2
-Hold out parent budget: H_parent
-Use Q/V transitive only for H_parent
-Evaluate heldout parent classification
+Train direct supervised labels for shorter budgets.
+Remove or heavily reduce labels for a longer parent budget.
+Use Q/V transitive only for the parent budget.
+Evaluate heldout parent-budget reachability.
 ```
 
-This directly tests whether shorter-budget reachability knowledge can compose into a longer-budget parent.
+This directly tests whether shorter-budget knowledge composes into longer-budget reachability.
 
 ---
 
-## 5. Experimental summary
+## 6. Experiments
 
-All experiments were run on `pointmaze-medium-navigate-v0` unless otherwise noted. The current repository contains detailed logs in the `BMM_TRL_*.md` files.
+All experiments were on `pointmaze-medium-navigate-v0` unless otherwise stated. Detailed logs are in the `BMM_TRL_*.md` files in this repository.
 
-### 5.1 Logged-offset labels failed
+### 6.1 Logged-offset labels failed
 
-The initial idea used same-trajectory logged offset as the label:
+The first target was same-trajectory logged offset:
 
 ```text
 label = 1[offset <= H].
 ```
 
-This failed at high budgets. Diagnostics showed:
+This failed at high budgets. Diagnostics showed that the same BMM JAX critic learned deterministic chains, fixed-batch PointMaze overfit worked through `H=512`, but heldout PointMaze logged-offset labels failed at `H=256/512`. kNN on logged-offset labels was near chance: about `0.54` at `H=256` and `0.52` at `H=512`.
 
-- the same JAX critic path learns a deterministic chain through `H=512`;
-- fixed-batch PointMaze overfit works through high budgets;
-- heldout logged-offset labels fail at `H=256/512`;
-- kNN on logged-offset labels is near chance: about `0.54` at `H=256` and `0.52` at `H=512`.
+Conclusion: logged offset is behavior time, not clean reachability. It should be used as a source of positives, not hard high-budget negatives.
 
-Conclusion: logged offset is behavior time, not clean reachability.
+### 6.2 Grid/geodesic labels worked
 
-### 5.2 Grid/geodesic reachability labels worked
-
-PointMaze medium has 2D observations with `xy` dimensions `(0,1)`. The layout/grid BFS target showed:
+PointMaze medium exposes its layout. The calibrated grid context was:
 
 ```text
 median one-step xy displacement = 0.202063
@@ -379,7 +403,7 @@ steps per cell = 19.7958
 max grid distance = 11 cells / 217.75 steps
 ```
 
-Thus `H=256/512` are above the calibrated medium-maze diameter and should be one-class under true geodesic reachability.
+Thus `H=256/512` are above the calibrated medium-maze diameter and are one-class under true geodesic reachability.
 
 The state-only geodesic value critic trained on fresh supervised batches and passed heldout thresholds:
 
@@ -390,43 +414,45 @@ The state-only geodesic value critic trained on fresh supervised batches and pas
 | 96 | 0.9588 | 0.5916 | 0.9591 | 0.5903 |
 | 128 | 0.9751 | 0.5476 | 0.9755 | 0.5402 |
 
-Monotonicity violation was `0.0000`.
+Monotonicity violation was `0.0000`. The action-conditioned geodesic Q critic also passed clean supervised diagnostics using the next-state target.
 
-The action-conditioned geodesic Q critic also passed clean supervised diagnostics with target
+### 6.3 Transitive consistency was stable but not decisive with abundant labels
 
-```text
-Q_H(s_t,a_t,g) = 1[d_grid(s_{t+1},g) <= H-1].
-```
+State-only V transitive sweeps showed no catastrophic degradation. For example:
 
-### 5.3 Q/V transitive was stable but not enough in abundant-label settings
+| lambda_trans | H | AUC | Gap |
+|---:|---:|---:|---:|
+| 0.000 | 64 | 0.9636 | 0.5017 |
+| 0.000 | 128 | 0.9753 | 0.5479 |
+| 0.010 | 64 | 0.9649 | 0.4910 |
+| 0.010 | 128 | 0.9792 | 0.5739 |
+| 0.025 | 64 | 0.9648 | 0.4914 |
+| 0.025 | 128 | 0.9793 | 0.5719 |
 
-A frozen state-value teacher trained on budgets `(40,80,160)` had:
+Multi-witness targets were limited by witness geometry at small budgets. For `H=64`, only about `1.1` valid witness cells were available on average, so `K=4` mostly repeated the same witness.
 
-| Row | H=40 AUC/gap | H=80 AUC/gap | H=160 AUC/gap |
-|---|---:|---:|---:|
-| V supervised teacher | 0.9531 / 0.4625 | 0.9749 / 0.4995 | 0.9854 / 0.7048 |
+### 6.4 Q/V transitive improved consistency but not abundant-label classification
 
-Q supervised and Q+Q/V transitive both passed:
+Q/V transitive with a frozen V teacher passed the no-degradation gate and improved Q-V-next consistency:
 
-| Row | H=40 AUC/gap | H=80 AUC/gap | H=160 AUC/gap |
-|---|---:|---:|---:|
-| Q supervised | 0.9563 / 0.5359 | 0.9786 / 0.5138 | 0.9875 / 0.6421 |
-| Q + Q/V transitive | 0.9565 / 0.5063 | 0.9763 / 0.4674 | 0.9857 / 0.6712 |
+| Mode | H40 AUC | H40 Gap | H80 AUC | H80 Gap | H160 AUC | H160 Gap | Q-V Next Abs Diff |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| supervised only | 0.9563 | 0.5359 | 0.9786 | 0.5138 | 0.9875 | 0.6421 | 0.2036 |
+| bce_lower_bound | 0.9564 | 0.5058 | 0.9765 | 0.4677 | 0.9857 | 0.6728 | 0.1327 |
 
-Q/V transitive reduced Q-V-next absolute probability difference from `0.2036` to `0.1345`, but did not produce an abundant-label classification win.
+Thus Q/V transitive was stable and improved consistency, but abundant direct labels already saturated classification performance.
 
-### 5.4 Budget-holdout showed the strongest BMM-specific positive result
+### 6.5 Budget-holdout: strongest positive result
 
-The strongest result came from holding out the parent budget.
+Budget holdout was the strongest BMM-specific result.
 
-#### Grid-cell budget holdout
+#### Grid-cell H8 holdout
 
 Setup:
 
 ```text
 supervised budgets = (2,4)
 heldout parent = 8
-variants = A/B/C/D/F
 ```
 
 Three-seed aggregate:
@@ -437,14 +463,13 @@ Three-seed aggregate:
 | D-C | 0,1,2 | +0.0116 | +0.0507 | -0.1503 | -0.0758 | +0.0011 | few-parent BMM effect |
 | F-A | 0,1,2 | +0.0002 | +0.0017 | -0.0063 | -0.0010 | -0.0005 | V-next distill control |
 
-#### Env-step budget holdout
+#### Env-step H160 holdout
 
 Setup:
 
 ```text
 supervised budgets = (40,80)
 heldout parent = 160
-variants = A/B/C/D/F
 ```
 
 Three-seed aggregate:
@@ -455,11 +480,11 @@ Three-seed aggregate:
 | D-C | 0,1,2 | +0.0041 | +0.0498 | -0.1815 | -0.0547 | -0.0293 | few-parent BMM effect |
 | F-A | 0,1,2 | +0.0035 | +0.0030 | -0.0570 | -0.0016 | +0.0026 | V-next distill control |
 
-Conclusion: shorter-budget Q/V knowledge helps heldout longer-budget parent classification. The V-next distillation control is much smaller, suggesting the improvement is BMM-specific.
+Conclusion: shorter-budget Q/V knowledge helps heldout longer-budget parent classification. The V-next control is much smaller, suggesting the gain is BMM-specific rather than generic teacher smoothing.
 
-### 5.5 Dataset-support graph labels were learnable and mildly positive
+### 6.6 Dataset-support graph labels
 
-A conservative dataset-position graph was built from observed transitions:
+A dataset-position graph was constructed from observed transitions:
 
 ```text
 nodes = 1698
@@ -468,16 +493,7 @@ connected components = 1
 graph diameter = 73 hops / 146 calibrated steps
 ```
 
-Graph labels were clean and learnable for budgets below graph diameter. Example fixed-batch heldout graph-label results:
-
-| H | Eval AUC | Eval Gap | Eval Min AUC | Eval Min Gap |
-|---:|---:|---:|---:|---:|
-| 32 | 0.9474 | 0.5239 | 0.9445 | 0.5277 |
-| 64 | 0.9413 | 0.5047 | 0.9394 | 0.5066 |
-| 96 | 0.9728 | 0.6839 | 0.9734 | 0.6815 |
-| 128 | 0.9921 | 0.8095 | 0.9915 | 0.7899 |
-
-Graph-label budget holdout was mildly positive:
+Graph labels were clean and learnable for budgets below graph diameter. A graph-label budget-holdout diagnostic was mildly positive:
 
 | Variant | H120 AUC | H120 Gap | Q-V Abs Diff | Q-V Rank Corr |
 |---|---:|---:|---:|---:|
@@ -485,13 +501,13 @@ Graph-label budget holdout was mildly positive:
 | B Q/V transitive | 0.9849 | 0.3411 | 0.3277 | 0.8084 |
 | F V-next distill | 0.9780 | 0.3491 | 0.3265 | 0.7802 |
 
-This weakens the concern that BMM only works with grid-oracle labels, though the graph experiment remains a diagnostic rather than a full general offline RL result.
+This weakens the concern that BMM only works with grid-oracle labels, although the graph result is still diagnostic and modest.
 
-### 5.6 Flat action ranking did not work
+### 6.7 Policy-facing results
 
-An offline action-ranking diagnostic compared A/B/F critics on candidate actions. The initial same-cell candidate diagnostic was noisy; an improved version added oracle and V-next baselines.
+#### Flat action ranking
 
-On the more credible own-state action-ranking mode:
+Flat action ranking did not improve. On the credible own-state action-ranking mode:
 
 | Critic | AUC | Pair Acc | Selected Distance | Selected Success |
 |---|---:|---:|---:|---:|
@@ -499,32 +515,21 @@ On the more credible own-state action-ranking mode:
 | B | 0.6170 | 0.7890 | 163.8565 | 0.6895 |
 | F | 0.6321 | 0.7827 | 164.1272 | 0.6777 |
 
-BMM did not robustly beat A/F on action AUC. Flat action extraction was therefore not supported.
+BMM did not robustly beat A/F on action AUC.
 
-### 5.7 Joint Q/V action-subgoal extraction was also mixed
+#### Joint action-subgoal selection
 
-Candidate coverage was improved using `neighbor_cell`, `directional`, and `oracle_diverse` modes. Coverage was no longer the blocker:
+Candidate coverage was improved with neighbor-cell, directional, and oracle-diverse candidate modes. Coverage was no longer the blocker. Even then, BMM Q/V did not robustly win the full joint objective. It often improved action-valid metrics but not state-valid, path stretch, or midpoint quality.
 
-| Mode | Oracle Any Action-Valid | Unique Next Cells | Next-Distance Spread |
-|---|---:|---:|---:|
-| same_cell_cached | 0.0547 | 2.0781 | 21.0330 |
-| neighbor_cell | 1.0000 | 5.1641 | 75.0075 |
-| directional | 0.9922 | 5.3984 | 73.3063 |
-| oracle_diverse | 1.0000 | 7.5938 | 202.5975 |
+#### Value-only subgoal selection
 
-Even with useful candidates, BMM Q/V did not robustly win the full joint objective. It often improved action-valid and action-midpoint metrics, but not state-valid, path-stretch, or midpoint quality. This weakened the case for neural Q/V policy extraction.
-
-### 5.8 Value-only subgoal selection was positive, but controller bottleneck remained
-
-The value-only high-level score
+Value-only subgoal selection was more promising:
 
 ```text
-score(w) = min(V_h(s,w), V_{H-h}(w,g))
+score(w) = min(V_h(s,w), V_{H-h}(w,g)).
 ```
 
-worked better than Q/V action extraction.
-
-Selector comparison with same-cell NN controller:
+With a same-cell nearest-neighbor controller:
 
 | Selector | Success | Final Distance | Improve | Mean Step Goal | Subgoal Valid |
 |---|---:|---:|---:|---:|---:|
@@ -542,7 +547,7 @@ The graph-support subgoal diagnostic was also positive:
 | oracle_graph_midpoint | 0.6387 | 65.6875 | 15.2422 |
 | BMM_V_graph | 0.9902 | 4.7734 | 70.6406 |
 
-However, the hierarchical policy pivot did not clear the final go/no-go criterion. With a stronger 5k-step, larger BC controller:
+However, the hierarchical pivot did not clear the final go/no-go criterion. With a stronger 5k-step, larger BC controller:
 
 | Selector | Success | Final Distance | Improve | Subgoal Valid | Subgoal Reduce | Goal Reduce |
 |---|---:|---:|---:|---:|---:|---:|
@@ -551,120 +556,110 @@ However, the hierarchical policy pivot did not clear the final go/no-go criterio
 | BMM_V | 0.0000 | 106.8972 | 67.3057 | 0.6100 | 0.0340 | 0.0340 |
 | oracle_midpoint | 0.0000 | 122.7339 | 51.4690 | 0.1960 | 0.2800 | 0.1720 |
 
-BMM/V tied geometric midpoint on final distance and improvement, so the hierarchical pivot did not pass the continue gate.
+BMM/V tied geometric midpoint on final distance and improvement. Therefore the current hierarchical policy route did not pass its continue gate.
 
 ---
 
-## 6. Overall conclusions
+## 7. Discussion
 
-### 6.1 What worked
+### 7.1 Strengths found
 
-1. The mathematical BMM operator has the desired non-expansive error property for deterministic/support reachability.
-2. The implementation can learn clean budgeted reachability classifiers.
-3. Logged-offset high-budget targets were correctly diagnosed as flawed behavior-time labels.
-4. Geodesic and support-graph targets are learnable.
-5. Q/V transitive budget-holdout improves heldout long-budget classification across seeds.
-6. The improvement is not explained by simple V-next distillation.
-7. Value-based BMM subgoal selection gives useful intermediate goals in diagnostics.
+1. **Clear theoretical property.** BMM's max-min reachability operator has the desired non-expansive error recurrence in deterministic/support settings.
+2. **Target diagnosis.** The project identified a key failure mode: same-trajectory logged offsets are behavior-time labels, not high-budget reachability labels.
+3. **Clean labels are learnable.** Geodesic and support-graph reachability labels are learnable with the current architecture.
+4. **Budget-holdout gains.** Q/V transitive bootstrapping improves heldout long-budget reachability across seeds.
+5. **BMM-specific control.** V-next distillation does not explain the budget-holdout gains.
+6. **Subgoal signal.** Value-level BMM subgoal selection gives useful intermediate goals in diagnostics.
 
-### 6.2 What did not work
+### 7.2 Limitations found
 
-1. The current prototype did not show robust flat action-ranking gains.
-2. Q/V joint action-subgoal selection did not become robust even after improving candidate coverage.
-3. Lightweight hierarchical control did not make BMM/V outperform a simple geometric midpoint baseline.
-4. No policy smoke solved the tasks.
-5. The method is not ready for broad OGBench policy benchmarks.
-
-### 6.3 Current project status
-
-The evidence supports a **critic/reachability/subgoal diagnostic contribution**, not an end-to-end policy algorithm.
-
-A fair statement is:
-
-```text
-BMM-TRL provides a max-min budgeted reachability objective with logarithmic-depth error propagation in deterministic/support settings. In PointMaze diagnostics, Q/V transitive consistency improves heldout parent-budget reachability. However, converting this critic-level improvement into robust policy improvement remains unresolved.
-```
+1. **No robust policy improvement.** The prototype did not produce a robust policy-improvement path.
+2. **Flat Q extraction failed.** Better long-budget reachability did not translate into better one-step action ranking.
+3. **Joint Q/V action-subgoal extraction was mixed.** Even with better candidates, it did not robustly beat controls.
+4. **Controller bottleneck.** Hierarchical use depends strongly on the low-level controller.
+5. **Grid labels are diagnostic, not general.** Dataset-support graph labels are the more general target, but still require good representation and graph construction.
+6. **Stochastic extension remains theoretical.** The current implementation is deterministic/support reachability, not full stochastic success probability.
 
 ---
 
-## 7. Recommended decision
+## 8. Future directions
 
-### Recommended action
+### 8.1 Support-graph BMM as the main offline target
 
-Pause active policy-facing experimentation.
-
-Do not continue with:
+The most important future direction is to replace grid/geodesic oracles with train-only support graphs:
 
 ```text
-flat Q extraction;
-Q/V action extraction;
-more sparse-Q tables;
-more loss/witness tuning;
-PointMaze-large policy runs;
-broad OGBench benchmarks.
+nodes: offline states or learned latent clusters
+edges: observed transitions and conservative support-preserving stitching edges
+target: R_H^D(s,g)=1[d_D(phi(s),phi(g)) <= H]
 ```
 
-### Viable paths
+A strong future result would show budget-holdout gains on train-only support graphs with heldout validation states mapped conservatively to graph nodes.
 
-There are three possible next directions:
+### 8.2 Latent support graphs
 
-#### Option A: Write up as a diagnostic/methods note
+For more general offline domains, raw coordinates are not available. Future work should learn representations `phi(s)` for graph construction using temporal contrastive learning, inverse-dynamics-aware representation learning, or goal-conditioned value embeddings. BMM's target quality will likely depend heavily on representation quality.
 
-This is the recommended low-compute path. Focus on:
+### 8.3 Stochastic reliability budgets
 
-```text
-BMM theory;
-logged-offset target failure;
-geodesic/support reachability targets;
-budget-holdout Q/V gains;
-limitations of policy extraction.
-```
+The deterministic max-min identity can be extended conservatively to stochastic settings with an additional reliability budget. This direction would learn thresholded success-probability predicates rather than binary support reachability. It is mathematically promising but more complex than the current prototype.
 
-#### Option B: Formal hierarchical RL pivot
+### 8.4 Hierarchical planning with a strong low-level controller
 
-Only pursue if the project is explicitly reframed around high-level planning plus a strong low-level controller. This would require:
+The most plausible policy-facing direction is to use BMM/V for high-level subgoal planning and pair it with a separately trained low-level controller. A serious version would require comparison to HIQL/HIGL-style baselines and geometric/graph midpoint planners.
 
-```text
-strong goal-conditioned low-level policy;
-subgoal proposal over support states;
-replanning;
-comparison to geometric/graph/HIQL-style baselines.
-```
+### 8.5 Better subgoal proposal
 
-This is effectively a new hierarchical RL project.
+Current diagnostics often sample broad candidate sets. A deployable algorithm needs learned or graph-based proposal mechanisms that produce useful candidate subgoals without oracle grid knowledge.
 
-#### Option C: Pause and move on
+### 8.6 Theory with projection error and finite samples
 
-This is reasonable if the goal is a high-impact offline RL policy result. The current policy-facing signal is not strong enough to justify more compute without a new low-level controller effort.
+The clean `O(log H)` result assumes sup-norm residual control. Future theory should analyze projection error, finite-sample classification error, witness sampling error, and conservative lower-bound losses.
 
 ---
 
-## 8. Suggested advisor-facing summary
+## 9. Conclusion
 
-The concise advisor message is:
+BMM-TRL was motivated by a simple but important algebraic observation: if value composition is additive in distance space, then branch errors can add. By learning budgeted reachability and composing with max-min, the ideal deterministic/support operator has logarithmic-depth sup-norm error accumulation.
 
-```text
-We proposed BMM-TRL to replace additive/product transitive value composition with a budgeted max-min reachability objective. The theory gives O(log H) sup-norm error accumulation for deterministic/support reachability. Experimentally, the critic/reachability side works: logged-offset targets fail, geodesic/support targets are learnable, and Q/V transitive improves heldout long-budget classification across seeds. However, flat action extraction and lightweight hierarchical control did not produce robust policy gains. The current recommendation is to pause policy-facing experimentation and either write this as a diagnostic/methods note or formally pivot to a hierarchical RL project with a stronger low-level controller.
-```
+The prototype validated the reachability side of this idea. Clean geodesic and support-graph targets are learnable, and Q/V max-min transitive consistency improves heldout long-budget reachability in budget-holdout diagnostics. This is the strongest scientific outcome of the project.
+
+The prototype did not validate BMM as an end-to-end offline RL policy method. Flat action ranking, joint Q/V action-subgoal extraction, and lightweight hierarchical control did not produce robust policy gains. The current evidence supports pausing active policy-facing experimentation and preserving the work as a critic/reachability/subgoal-planning technical result, or formally pivoting to a new hierarchical RL project with a stronger low-level controller.
 
 ---
 
-## 9. Files and artifacts referenced
+## References
 
-Key result files:
+- Andrychowicz, M., Wolski, F., Ray, A., Schneider, J., Fong, R., Welinder, P., McGrew, B., Tobin, J., Abbeel, P., and Zaremba, W. **Hindsight Experience Replay.** NeurIPS, 2017. https://arxiv.org/abs/1707.01495
+- Bellman, R. **Dynamic Programming.** Princeton University Press, 1957.
+- Bertsekas, D. P. **Dynamic Programming and Optimal Control.** Athena Scientific.
+- Kostrikov, I., Nair, A., and Levine, S. **Offline Reinforcement Learning with Implicit Q-Learning.** ICLR, 2022. https://arxiv.org/abs/2110.06169
+- Park, S., Ghosh, D., Eysenbach, B., and Levine, S. **HIQL: Offline Goal-Conditioned RL with Latent States as Actions.** NeurIPS, 2023. https://arxiv.org/abs/2307.11949
+- Park, S., Frans, K., Eysenbach, B., and Levine, S. **OGBench: Benchmarking Offline Goal-Conditioned RL.** 2024. https://arxiv.org/abs/2410.20092
+- Park, S., Oberai, A., Atreya, P., and Levine, S. **Transitive RL: Value Learning via Divide and Conquer.** 2025. https://arxiv.org/abs/2510.22512
+- Schaul, T., Horgan, D., Gregor, K., and Silver, D. **Universal Value Function Approximators.** ICML, 2015. https://proceedings.mlr.press/v37/schaul15.html
+
+---
+
+## Key repository artifacts
+
+Result files:
 
 ```text
 BMM_TRL_STATUS_20260610_181801.md
 BMM_TRL_GEODESIC_VALUE_RESULTS_20260610_184508.md
+BMM_TRL_GEODESIC_Q_RESULTS_20260610_191752.md
 BMM_TRL_QV_TRANSITIVE_RESULTS_20260610_213730.md
+BMM_TRL_QV_LOSS_ABLATION_RESULTS_20260610_221317.md
 BMM_TRL_BUDGET_HOLDOUT_REPLICATION_RESULTS_20260611_014354.md
 BMM_TRL_FAST_DECISION_RESULTS_20260611_124920.md
 BMM_TRL_CANDIDATE_ACTION_RESULTS_20260611_135918.md
 BMM_TRL_VALUE_SUBGOAL_NEXT_STEPS_RESULTS_20260611_163357.md
+BMM_TRL_VALUE_SUBGOAL_CONTROLLER_DECISION_20260611_170712.md
 BMM_TRL_HIERARCHICAL_PIVOT_QUICK_TRY_20260611_173408.md
 ```
 
-Key implementation files:
+Implementation files:
 
 ```text
 agents/bmm_trl.py
@@ -675,6 +670,7 @@ scripts/train_bmm_geodesic_q.py
 scripts/run_bmm_qv_budget_holdout.py
 scripts/eval_bmm_action_ranking.py
 scripts/eval_bmm_joint_action_subgoal.py
+scripts/eval_bmm_value_subgoal_controller.py
 scripts/eval_bmm_value_subgoal_policy_smoke.py
 scripts/eval_bmm_graph_value_subgoal.py
 scripts/eval_bmm_subgoal_bc_controller.py
