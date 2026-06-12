@@ -35,8 +35,10 @@ def make_nn_controller_context(train_dataset, context, controller_hops):
     by_cell = ar.transition_indices_by_cell(train_dataset, state_to_cell)
     cell_distances = np.asarray(context["cell_distances"], dtype=np.int32)
     step_distances = cell_distances.astype(np.float32) * float(context["distance_scale"])
+    local_pools = []
     neighbor_pools = []
     for source_cell in range(cell_distances.shape[0]):
+        local_pools.append(local_transition_pool(by_cell, [source_cell]))
         neighbor_cells = np.nonzero(
             (cell_distances[source_cell] >= 0)
             & (cell_distances[source_cell] <= int(controller_hops))
@@ -46,6 +48,7 @@ def make_nn_controller_context(train_dataset, context, controller_hops):
         state_to_cell=state_to_cell,
         cell_distances=cell_distances,
         step_distances=step_distances,
+        local_pools=local_pools,
         neighbor_pools=neighbor_pools,
         controller_hops=int(controller_hops),
     )
@@ -153,10 +156,190 @@ def nn_controller_metrics(scores, batch, controller):
     )
 
 
+def _choice_metrics_for_target(
+    selected,
+    batch,
+    controller,
+    *,
+    target_cells,
+    choice_mode,
+):
+    rows = np.arange(len(selected))
+    source_cells = np.asarray(batch["source_cells"], dtype=np.int32)
+    goal_cells = np.asarray(batch["goal_cells"], dtype=np.int32)
+    subgoal_cells = np.asarray(batch["subgoal_cells"], dtype=np.int32)[rows, selected]
+    step_distances = np.asarray(controller["step_distances"], dtype=np.float32)
+    state_to_cell = np.asarray(controller["state_to_cell"], dtype=np.int32)
+    pools = controller.get("local_pools", controller["neighbor_pools"])
+
+    valid = []
+    source_to_query = []
+    subgoal_before = []
+    subgoal_after = []
+    goal_before = []
+    goal_after = []
+    selected_transition_idxs = []
+
+    for source_cell, subgoal_cell, goal_cell, target_cell in zip(
+        source_cells, subgoal_cells, goal_cells, target_cells
+    ):
+        source_cell = int(source_cell)
+        subgoal_cell = int(subgoal_cell)
+        goal_cell = int(goal_cell)
+        target_cell = int(target_cell)
+        pool = np.asarray(pools[source_cell], dtype=np.int32)
+        before_subgoal = float(step_distances[source_cell, subgoal_cell])
+        before_goal = float(step_distances[source_cell, goal_cell])
+        subgoal_before.append(before_subgoal)
+        goal_before.append(before_goal)
+
+        if len(pool) == 0:
+            valid.append(0.0)
+            source_to_query.append(np.nan)
+            subgoal_after.append(np.nan)
+            goal_after.append(np.nan)
+            selected_transition_idxs.append(-1)
+            continue
+
+        transition_cells = state_to_cell[pool]
+        transition_next_cells = state_to_cell[pool + 1]
+        finite = (
+            (transition_cells >= 0)
+            & (transition_next_cells >= 0)
+            & (step_distances[source_cell, transition_cells] >= 0)
+            & (step_distances[transition_next_cells, target_cell] >= 0)
+            & (step_distances[transition_next_cells, subgoal_cell] >= 0)
+            & (step_distances[transition_next_cells, goal_cell] >= 0)
+        )
+        if not finite.any():
+            valid.append(0.0)
+            source_to_query.append(np.nan)
+            subgoal_after.append(np.nan)
+            goal_after.append(np.nan)
+            selected_transition_idxs.append(-1)
+            continue
+
+        valid_pool = pool[finite]
+        valid_sources = transition_cells[finite]
+        valid_next = transition_next_cells[finite]
+        target_next_distances = step_distances[valid_next, target_cell]
+        subgoal_next_distances = step_distances[valid_next, subgoal_cell]
+        goal_next_distances = step_distances[valid_next, goal_cell]
+
+        if choice_mode == "min_target":
+            chosen = int(np.argmin(target_next_distances))
+            selected_transition_idxs.append(int(valid_pool[chosen]))
+            source_to_query.append(float(step_distances[source_cell, valid_sources[chosen]]))
+            subgoal_after.append(float(subgoal_next_distances[chosen]))
+            goal_after.append(float(goal_next_distances[chosen]))
+        elif choice_mode == "random_mean":
+            selected_transition_idxs.extend(int(idx) for idx in valid_pool)
+            source_to_query.append(
+                float(step_distances[source_cell, valid_sources].mean())
+            )
+            subgoal_after.append(float(subgoal_next_distances.mean()))
+            goal_after.append(float(goal_next_distances.mean()))
+        else:
+            raise ValueError(f"Unsupported choice_mode={choice_mode}")
+        valid.append(1.0)
+
+    valid = np.asarray(valid, dtype=np.float32)
+    valid_mask = valid > 0.0
+    subgoal_before = np.asarray(subgoal_before, dtype=np.float32)
+    subgoal_after = np.asarray(subgoal_after, dtype=np.float32)
+    goal_before = np.asarray(goal_before, dtype=np.float32)
+    goal_after = np.asarray(goal_after, dtype=np.float32)
+    source_to_query = np.asarray(source_to_query, dtype=np.float32)
+
+    def masked_mean(values):
+        if not valid_mask.any():
+            return float("nan")
+        return float(np.asarray(values, dtype=np.float32)[valid_mask].mean())
+
+    subgoal_improvement = subgoal_before - subgoal_after
+    goal_improvement = goal_before - goal_after
+    return dict(
+        valid_frac=float(valid.mean()),
+        subgoal_before=masked_mean(subgoal_before),
+        subgoal_after=masked_mean(subgoal_after),
+        subgoal_improvement=masked_mean(subgoal_improvement),
+        subgoal_reduces_frac=float(
+            ((subgoal_improvement > 0.0) & valid_mask).sum() / max(valid_mask.sum(), 1)
+        ),
+        goal_before=masked_mean(goal_before),
+        goal_after=masked_mean(goal_after),
+        goal_improvement=masked_mean(goal_improvement),
+        goal_reduces_frac=float(
+            ((goal_improvement > 0.0) & valid_mask).sum() / max(valid_mask.sum(), 1)
+        ),
+        source_to_query=masked_mean(source_to_query),
+        selected_unique_actions=int(
+            len(np.unique([idx for idx in selected_transition_idxs if idx >= 0]))
+        ),
+    )
+
+
+def add_prefixed(metrics, prefix, values):
+    for key, value in values.items():
+        metrics[f"{prefix}_{key}"] = value
+
+
+def low_level_controller_metrics(scores, batch, controller):
+    selected = selected_indices(scores)
+    rows = np.arange(len(selected))
+    subgoal_cells = np.asarray(batch["subgoal_cells"], dtype=np.int32)[rows, selected]
+    goal_cells = np.asarray(batch["goal_cells"], dtype=np.int32)
+    metrics = {}
+    add_prefixed(
+        metrics,
+        "local_progress_max",
+        _choice_metrics_for_target(
+            selected,
+            batch,
+            controller,
+            target_cells=subgoal_cells,
+            choice_mode="min_target",
+        ),
+    )
+    add_prefixed(
+        metrics,
+        "direct_goal_same_cell",
+        _choice_metrics_for_target(
+            selected,
+            batch,
+            controller,
+            target_cells=goal_cells,
+            choice_mode="min_target",
+        ),
+    )
+    add_prefixed(
+        metrics,
+        "random_same_cell",
+        _choice_metrics_for_target(
+            selected,
+            batch,
+            controller,
+            target_cells=subgoal_cells,
+            choice_mode="random_mean",
+        ),
+    )
+    return metrics
+
+
+def geometric_midpoint_scores(batch):
+    midpoint = 0.5 * (
+        np.asarray(batch["source_observations"], dtype=np.float32)[:, None, :2]
+        + np.asarray(batch["goals"], dtype=np.float32)[:, None, :2]
+    )
+    subgoals = np.asarray(batch["subgoal_observations"], dtype=np.float32)
+    return -np.linalg.norm(subgoals[:, :, :2] - midpoint, axis=-1)
+
+
 def score_rows(value_agent, batch, batch_size, rng):
     rows = []
     for name, scores in subgoal.oracle_baselines(batch, rng).items():
         rows.append((name, scores))
+    rows.append(("geometric_midpoint", geometric_midpoint_scores(batch)))
     rows.append(("BMM_V_value", subgoal.score_vv(value_agent, batch, batch_size)))
     return rows
 
@@ -164,6 +347,7 @@ def score_rows(value_agent, batch, batch_size, rng):
 def row_metrics(scores, batch, controller):
     metrics = dict(subgoal.selection_metrics(scores, batch))
     metrics.update(nn_controller_metrics(scores, batch, controller))
+    metrics.update(low_level_controller_metrics(scores, batch, controller))
     return metrics
 
 
@@ -177,24 +361,24 @@ def markdown(result):
         f"controller hops: `{result['controller_hops']}`",
         f"value checkpoint: `{result['value_restore_path']}:{result['value_restore_epoch']}`",
         "",
-        "| scorer | state_valid | source_stretch | midpoint_err | source_d | right_d | nn_valid | nn_query_improve | nn_query_reduce | nn_next_d | nn_src_to_query | unique_cells |",
+        "| scorer | state_valid | source_stretch | midpoint_err | source_d | right_d | local_subgoal_improve | local_goal_improve | local_goal_reduce | direct_goal_improve | random_subgoal_improve | unique_cells |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in result["rows"]:
         m = row["metrics"]
         lines.append(
-            "| {name} | {sv} | {ss} | {me} | {sd} | {rd} | {nv} | {nqi} | {nqr} | {nnd} | {nstq} | {uc} |".format(
+            "| {name} | {sv} | {ss} | {me} | {sd} | {rd} | {lsi} | {lgi} | {lgr} | {dgi} | {rsi} | {uc} |".format(
                 name=row["name"],
                 sv=format_metric(m["state_valid_frac"]),
                 ss=format_metric(m["source_path_stretch"]),
                 me=format_metric(m["midpoint_error"]),
                 sd=format_metric(m["selected_source_distance"]),
                 rd=format_metric(m["selected_right_distance"]),
-                nv=format_metric(m["nn_valid_frac"]),
-                nqi=format_metric(m["nn_query_improvement"]),
-                nqr=format_metric(m["nn_query_reduces_frac"]),
-                nnd=format_metric(m["nn_next_distance"]),
-                nstq=format_metric(m["nn_source_to_query_distance"]),
+                lsi=format_metric(m["local_progress_max_subgoal_improvement"]),
+                lgi=format_metric(m["local_progress_max_goal_improvement"]),
+                lgr=format_metric(m["local_progress_max_goal_reduces_frac"]),
+                dgi=format_metric(m["direct_goal_same_cell_goal_improvement"]),
+                rsi=format_metric(m["random_same_cell_subgoal_improvement"]),
                 uc=m["selected_unique_cells"],
             )
         )

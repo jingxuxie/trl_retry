@@ -16,6 +16,7 @@ from scripts import eval_bmm_value_subgoal_controller as diag
 def main():
     batch = {
         "source_cells": np.asarray([0, 0], dtype=np.int32),
+        "goal_cells": np.asarray([2, 2], dtype=np.int32),
         "subgoal_cells": np.asarray([[1, 2], [2, 1]], dtype=np.int32),
     }
     step_distances = np.asarray(
@@ -48,6 +49,14 @@ def main():
     missing = diag.nn_controller_metrics(scores, batch, missing_controller)
     assert np.isclose(missing["nn_valid_frac"], 0.0)
     assert np.isnan(missing["nn_query_improvement"])
+
+    low_level = diag.low_level_controller_metrics(scores, batch, controller)
+    assert np.isclose(low_level["local_progress_max_valid_frac"], 1.0)
+    assert np.isclose(low_level["local_progress_max_subgoal_improvement"], 6.0)
+    assert np.isclose(low_level["local_progress_max_goal_improvement"], 8.0)
+    assert np.isclose(low_level["local_progress_max_subgoal_reduces_frac"], 1.0)
+    assert np.isclose(low_level["direct_goal_same_cell_goal_improvement"], 8.0)
+    assert np.isclose(low_level["random_same_cell_subgoal_improvement"], 6.0)
 
     print("BMM value-subgoal controller diagnostic checks passed.")
 

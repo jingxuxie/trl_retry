@@ -273,9 +273,12 @@ def run_policy_smoke(env, policy, task_ids, episodes_per_task, max_steps):
                 if choice is None:
                     action = np.zeros(policy.action_dim, dtype=np.float32)
                 else:
-                    action, _ = policy.action_toward(
-                        choice["source_cell"], choice["subgoal_cell"]
-                    )
+                    if hasattr(policy, "action_for_choice"):
+                        action = policy.action_for_choice(observation, goal, choice)
+                    else:
+                        action, _ = policy.action_toward(
+                            choice["source_cell"], choice["subgoal_cell"]
+                        )
                     subgoal_valids.append(
                         float(
                             choice["source_to_subgoal"] <= policy.left_budget
