@@ -2,6 +2,16 @@
 
 Date: 2026-06-10
 
+Update as of 2026-06-18: this file is now historical. The project has moved
+past the original PointMaze high-budget diagnostic failure into graph/geodesic
+targets, Q/V budget-holdout controls, and fixed-controller success-rate
+experiments. The current paper-facing success-rate evidence is summarized in
+`BMM_TRL_ADVANCED_TASK_RESULTS.md`: BMM graph planning reaches 100.0% on
+`puzzle-3x3-play-oraclerep-v0` over 75 rollouts and 72.0% on
+`humanoidmaze-medium-navigate-oraclerep-v0` over 75 rollouts with the
+switch-128 graph-controller protocol, matching or exceeding the corresponding
+paper targets under a fixed paper-style TRL/RPG controller.
+
 This is a compact shareable summary of the current BMM-TRL diagnostic state. The implementation is in this TRL repo and OGBench has not been modified.
 
 ## Current Question
@@ -267,40 +277,3 @@ These are intentionally small and diagnostic-only.
 
 5. Consider using a geodesic/shortest-path proxy in PointMaze diagnostics.
    - Same-trajectory offset may be a weak label for true reachability in maze geometry.
-
-## Copy-Paste Help Request
-
-```text
-Hi, I am debugging a BMM-TRL prototype for offline goal-conditioned RL on OGBench PointMaze.
-
-The code and diagnostic summary are here:
-https://github.com/jingxuxie/trl/blob/main/BMM_TRL_DIAGNOSTIC_SUMMARY.md
-
-The key issue: a budget-conditioned reachability critic R(s,a,g,H) learns small-budget reachability but fails at high budgets H=256/512. This happens even with balanced supervised labels where each budget has 2048 positives and 2048 negatives, and the training batches also contain valid balanced high-budget examples.
-
-For example, with supervised BCE only and scalar+one-hot budget features at 10k steps:
-  H=64:  AUC=0.8441, gap=0.3663
-  H=128: AUC=0.6784, gap=0.0965
-  H=256: AUC=0.5221, gap=0.0032
-  H=512: AUC=0.5191, gap=0.0031
-
-So H=256/512 are basically random. One-hot budget conditioning did not help, and monotonicity got worse. Earlier hard-negative and weighted-hard-negative BMM losses reduced score scale but still left H=512 with almost no separation.
-
-I would especially like feedback on:
-
-1. Is the action-conditioned critic label well-posed?
-   The label is same-trajectory offset <= H, but the critic is R(s,a,g,H). Is this mismatched for PointMaze?
-
-2. Should I first test a state-only diagnostic critic R(s,g,H)?
-   Would that better isolate whether the problem is action-conditioning versus budget representation/objective?
-
-3. Is balanced BCE enough for this diagnostic, or is pairwise budget ranking essential?
-   Ranking is implemented but currently too slow in my PointMaze training path.
-
-4. Could same-trajectory offset be a bad high-budget label in PointMaze because alternate shorter paths exist?
-   Should diagnostics use graph/geodesic distance instead?
-
-5. What minimal diagnostic would you run next before doing any policy evaluation?
-
-I am not trying to tune policy performance yet. I only want the learned budgeted reachability classifier to pass diagnostics first.
-```

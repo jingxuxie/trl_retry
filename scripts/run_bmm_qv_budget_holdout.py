@@ -169,6 +169,12 @@ def train_command(args, spec, output_json, save_dir=None):
         f"--env_name={args.env_name}",
         f"--reachability_label_type={args.reachability_label_type}",
         f"--graph_path={args.graph_path}",
+        f"--graph_rep_key={args.graph_rep_key}",
+        f"--graph_rep_dims={args.graph_rep_dims}",
+        f"--graph_bin_size_factor={args.graph_bin_size_factor}",
+        f"--graph_full_distance_max_nodes={args.graph_full_distance_max_nodes}",
+        f"--graph_stats_sources={args.graph_stats_sources}",
+        f"--graph_build_mode={args.graph_build_mode}",
         f"--geodesic_budget_unit={args.geodesic_budget_unit}",
         f"--budgets={tuple_flag(parse_int_list(args.budgets))}",
         f"--eval_budgets={tuple_flag(parse_int_list(args.eval_budgets))}",
@@ -195,8 +201,12 @@ def train_command(args, spec, output_json, save_dir=None):
         f"--agent.actor_hidden_dims={args.actor_hidden_dims}",
         f"--agent.value_hidden_dims={args.value_hidden_dims}",
         f"--agent.layer_norm={args.layer_norm}",
+        f"--agent.budget_feature={args.budget_feature}",
+        f"--agent.critic_absdiff_goal_feature={args.critic_absdiff_goal_feature}",
         f"--output_json={output_json}",
     ]
+    if args.critic_obs_rep_key:
+        cmd.append(f"--critic_obs_rep_key={args.critic_obs_rep_key}")
     if save_dir is not None:
         cmd.extend(
             [
@@ -364,6 +374,16 @@ def parse_args(argv):
         choices=("grid_geodesic", "graph"),
     )
     parser.add_argument("--graph_path", default="exp/bmm_pointmaze_graph.npz")
+    parser.add_argument("--graph_rep_key", default="observations")
+    parser.add_argument("--graph_rep_dims", default="default")
+    parser.add_argument("--graph_bin_size_factor", type=float, default=2.0)
+    parser.add_argument("--graph_full_distance_max_nodes", type=int, default=5000)
+    parser.add_argument("--graph_stats_sources", type=int, default=256)
+    parser.add_argument(
+        "--graph_build_mode",
+        default="train_val",
+        choices=("train_val", "train_only"),
+    )
     parser.add_argument("--rebuild_graph", action="store_true")
     parser.add_argument("--geodesic_budget_unit", default="grid_cells")
     parser.add_argument("--budgets", default="2,4,8")
@@ -409,6 +429,9 @@ def parse_args(argv):
     parser.add_argument("--actor_hidden_dims", default="(256, 256)")
     parser.add_argument("--value_hidden_dims", default="(256, 256)")
     parser.add_argument("--layer_norm", default="False")
+    parser.add_argument("--budget_feature", default="log_scalar")
+    parser.add_argument("--critic_obs_rep_key", default=None)
+    parser.add_argument("--critic_absdiff_goal_feature", default="False")
     parser.add_argument("--fail_on_threshold", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument(

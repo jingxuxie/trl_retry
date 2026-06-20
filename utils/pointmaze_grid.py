@@ -182,6 +182,9 @@ def sample_grid_budget_pairs(
     grid_distances = []
     source_cells = []
     goal_cells = []
+    source_idxs_out = []
+    goal_idxs_out = []
+    goal_idxs_out = []
 
     def add_pairs(target_label, target_count):
         attempts = 0
@@ -218,6 +221,8 @@ def sample_grid_budget_pairs(
             grid_distances.append(float(distances[goal_cell]))
             source_cells.append(src_cell)
             goal_cells.append(goal_cell)
+            source_idxs_out.append(src_idx)
+            goal_idxs_out.append(goal_idx)
             target_count -= 1
 
     num_pos = int(num_pairs) // 2
@@ -236,6 +241,8 @@ def sample_grid_budget_pairs(
         grid_distances=np.asarray(grid_distances, dtype=np.float32),
         source_cells=np.asarray(source_cells, dtype=np.int32),
         goal_cells=np.asarray(goal_cells, dtype=np.int32),
+        source_idxs=np.asarray(source_idxs_out, dtype=np.int32),
+        goal_idxs=np.asarray(goal_idxs_out, dtype=np.int32),
     )
 
 
@@ -330,6 +337,7 @@ def sample_grid_budget_q_pairs(
             next_cells.append(next_cell)
             goal_cells.append(goal_cell)
             source_idxs_out.append(src_idx)
+            goal_idxs_out.append(goal_idx)
             target_count -= 1
 
     num_pos = int(num_pairs) // 2
@@ -352,6 +360,7 @@ def sample_grid_budget_q_pairs(
         next_cells=np.asarray(next_cells, dtype=np.int32),
         goal_cells=np.asarray(goal_cells, dtype=np.int32),
         source_idxs=np.asarray(source_idxs_out, dtype=np.int32),
+        goal_idxs=np.asarray(goal_idxs_out, dtype=np.int32),
     )
 
 

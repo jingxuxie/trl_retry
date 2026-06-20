@@ -78,6 +78,8 @@ def main():
     assert pair_batch is not None
     assert pair_batch["labels"].sum() > 0
     assert (pair_batch["labels"] == 0).sum() > 0
+    assert pair_batch["source_idxs"].shape == pair_batch["labels"].shape
+    assert pair_batch["goal_idxs"].shape == pair_batch["labels"].shape
     assert np.all(pair_batch["grid_distances"][pair_batch["labels"] == 1] <= 2)
     assert np.all(pair_batch["grid_distances"][pair_batch["labels"] == 0] > 2)
 

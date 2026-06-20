@@ -136,6 +136,18 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             oracle_offset_feature=self.config.get("oracle_offset_feature", False),
         )
 
+    def augment_goal_for_critic(self, observations, goals, budgets, offsets=None):
+        aug_goals = self.augment_goal(goals, budgets, offsets)
+        if self.config.get("critic_absdiff_goal_feature", False):
+            if observations.shape[-1] != goals.shape[-1]:
+                raise ValueError(
+                    "critic_absdiff_goal_feature requires matching observation "
+                    f"and goal dims, got {observations.shape[-1]} and {goals.shape[-1]}."
+                )
+            absdiff = jnp.abs(jnp.asarray(observations) - jnp.asarray(goals))
+            aug_goals = jnp.concatenate([aug_goals, absdiff], axis=-1)
+        return aug_goals
+
     def critic_logits_for(
         self,
         observations,
@@ -147,7 +159,9 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
         target=False,
     ):
         module = "target_critic" if target else "critic"
-        aug_goals = self.augment_goal(goals, budgets, offsets)
+        aug_goals = self.augment_goal_for_critic(
+            observations, goals, budgets, offsets
+        )
         maybe_actions = self.maybe_actions(actions)
         if grad_params is None or target:
             return self.network.select(module)(
@@ -217,143 +231,188 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
         )
         r = jax.nn.sigmoid(r_logits)
 
-        if batch["value_midpoint_goals"].ndim == batch[goal_key].ndim + 1:
-            witness_goals = batch["value_midpoint_goals"]
-            witness_shape = witness_goals.shape[:-1]
-            parent_observations = jnp.broadcast_to(
-                batch["observations"][None, ...],
-                witness_shape + batch["observations"].shape[-1:],
-            )
-            parent_actions = jnp.broadcast_to(
-                batch["actions"][None, ...],
-                witness_shape + batch["actions"].shape[-1:],
-            )
-            parent_goals = jnp.broadcast_to(
-                batch[goal_key][None, ...], witness_shape + batch[goal_key].shape[-1:]
-            )
-            first_logits = self.critic_logits_for_pair_grid(
-                parent_observations,
-                parent_actions,
-                witness_goals,
-                batch["value_left_budgets"],
-                offsets=batch.get(
-                    "value_midpoint_offsets", batch["value_left_budgets"]
-                ),
-                target=True,
-            )
-            second_logits = self.critic_logits_for_pair_grid(
-                batch["value_midpoint_observations"],
-                batch["value_midpoint_actions"],
-                parent_goals,
-                batch["value_right_budgets"],
-                offsets=batch["value_right_budgets"],
-                target=True,
-            )
-            first_r = jax.nn.sigmoid(first_logits)
-            second_r = jax.nn.sigmoid(second_logits)
-            witness_valids = jnp.asarray(
-                batch["trans_valids"], dtype=first_r.dtype
-            )
-            y_candidates = jnp.minimum(first_r, second_r)
-            y_candidates = jnp.where(witness_valids[None, ...] > 0, y_candidates, -1.0)
-            y_trans = jax.lax.stop_gradient(jnp.max(y_candidates, axis=1))
-            trans_valids = (witness_valids.max(axis=0) > 0).astype(r_logits.dtype)
+        compute_trans = float(self.config.get("lambda_trans", 0.0)) != 0.0
+        compute_pos = float(self.config.get("lambda_pos", 0.0)) != 0.0
+        compute_budget_neg = float(self.config.get("lambda_budget_neg", 0.0)) != 0.0
+        compute_hard_neg = float(self.config.get("lambda_hard_neg", 0.0)) != 0.0
+        compute_rand_hinge = float(self.config.get("lambda_rand_hinge", 0.0)) != 0.0
+        compute_mono = float(self.config.get("lambda_mono", 0.0)) != 0.0
+        compute_sup = float(self.config.get("lambda_sup", 0.0)) != 0.0
+        compute_rank = float(self.config.get("lambda_rank", 0.0)) != 0.0
+        zero_scalar = jnp.asarray(0.0, dtype=r_logits.dtype)
+        zero_r = jnp.zeros_like(r)
+
+        if compute_trans:
+            if batch["value_midpoint_goals"].ndim == batch[goal_key].ndim + 1:
+                witness_goals = batch["value_midpoint_goals"]
+                witness_shape = witness_goals.shape[:-1]
+                parent_observations = jnp.broadcast_to(
+                    batch["observations"][None, ...],
+                    witness_shape + batch["observations"].shape[-1:],
+                )
+                parent_actions = jnp.broadcast_to(
+                    batch["actions"][None, ...],
+                    witness_shape + batch["actions"].shape[-1:],
+                )
+                parent_goals = jnp.broadcast_to(
+                    batch[goal_key][None, ...],
+                    witness_shape + batch[goal_key].shape[-1:],
+                )
+                first_logits = self.critic_logits_for_pair_grid(
+                    parent_observations,
+                    parent_actions,
+                    witness_goals,
+                    batch["value_left_budgets"],
+                    offsets=batch.get(
+                        "value_midpoint_offsets", batch["value_left_budgets"]
+                    ),
+                    target=True,
+                )
+                second_logits = self.critic_logits_for_pair_grid(
+                    batch["value_midpoint_observations"],
+                    batch["value_midpoint_actions"],
+                    parent_goals,
+                    batch["value_right_budgets"],
+                    offsets=batch["value_right_budgets"],
+                    target=True,
+                )
+                first_r = jax.nn.sigmoid(first_logits)
+                second_r = jax.nn.sigmoid(second_logits)
+                witness_valids = jnp.asarray(
+                    batch["trans_valids"], dtype=first_r.dtype
+                )
+                y_candidates = jnp.minimum(first_r, second_r)
+                y_candidates = jnp.where(
+                    witness_valids[None, ...] > 0, y_candidates, -1.0
+                )
+                y_trans = jax.lax.stop_gradient(jnp.max(y_candidates, axis=1))
+                trans_valids = (witness_valids.max(axis=0) > 0).astype(
+                    r_logits.dtype
+                )
+            else:
+                first_logits = self.critic_logits_for(
+                    batch["observations"],
+                    batch["actions"],
+                    batch["value_midpoint_goals"],
+                    batch["value_left_budgets"],
+                    offsets=batch.get(
+                        "value_midpoint_offsets", batch["value_left_budgets"]
+                    ),
+                    target=True,
+                )
+                first_r = jax.nn.sigmoid(first_logits)
+
+                second_logits = self.critic_logits_for(
+                    batch["value_midpoint_observations"],
+                    batch["value_midpoint_actions"],
+                    batch[goal_key],
+                    batch["value_right_budgets"],
+                    offsets=batch["value_right_budgets"],
+                    target=True,
+                )
+                second_r = jax.nn.sigmoid(second_logits)
+
+                witness_valids = jnp.asarray(batch["trans_valids"], dtype=first_r.dtype)
+                y_trans = jax.lax.stop_gradient(jnp.minimum(first_r, second_r))
+                trans_valids = witness_valids
+
+            target_mask = trans_valids
+            while target_mask.ndim < y_trans.ndim:
+                target_mask = target_mask[None, ...]
+            y_trans = jnp.clip(y_trans, 0.0, 1.0)
+            y_trans = jnp.where(target_mask > 0, y_trans, 0.0)
+            loss_trans = masked_mean(self.bce_loss(r_logits, y_trans), trans_valids)
         else:
-            first_logits = self.critic_logits_for(
+            first_r = zero_r
+            second_r = zero_r
+            witness_valids = jnp.zeros_like(batch["value_budgets"], dtype=r_logits.dtype)
+            trans_valids = witness_valids
+            y_trans = zero_r
+            loss_trans = zero_scalar
+        loss_pos = (
+            self.bce_loss(r_logits, jnp.ones_like(r_logits)).mean()
+            if compute_pos
+            else zero_scalar
+        )
+
+        if compute_budget_neg:
+            neg_logits = self.critic_logits_for(
                 batch["observations"],
                 batch["actions"],
-                batch["value_midpoint_goals"],
-                batch["value_left_budgets"],
-                offsets=batch.get(
-                    "value_midpoint_offsets", batch["value_left_budgets"]
-                ),
-                target=True,
-            )
-            first_r = jax.nn.sigmoid(first_logits)
-
-            second_logits = self.critic_logits_for(
-                batch["value_midpoint_observations"],
-                batch["value_midpoint_actions"],
                 batch[goal_key],
-                batch["value_right_budgets"],
-                offsets=batch["value_right_budgets"],
-                target=True,
+                batch["value_neg_budgets"],
+                offsets=batch.get("value_offsets"),
+                grad_params=grad_params,
             )
-            second_r = jax.nn.sigmoid(second_logits)
+            neg_r = jax.nn.sigmoid(neg_logits)
+            loss_budget_neg = masked_mean(
+                self.bce_loss(neg_logits, jnp.zeros_like(neg_logits)),
+                batch["value_neg_valids"],
+            )
+        else:
+            neg_r = zero_r
+            loss_budget_neg = zero_scalar
 
-            witness_valids = jnp.asarray(batch["trans_valids"], dtype=first_r.dtype)
-            y_trans = jax.lax.stop_gradient(jnp.minimum(first_r, second_r))
-            trans_valids = witness_valids
+        if compute_hard_neg:
+            hard_neg_logits = self.critic_logits_for(
+                batch["observations"],
+                batch["actions"],
+                batch["value_hard_neg_goals"],
+                batch["value_hard_neg_budgets"],
+                offsets=batch.get("value_hard_neg_offsets"),
+                grad_params=grad_params,
+            )
+            hard_neg_r = jax.nn.sigmoid(hard_neg_logits)
+            loss_hard_neg = masked_mean(
+                self.bce_loss(hard_neg_logits, jnp.zeros_like(hard_neg_logits)),
+                batch["value_hard_neg_valids"],
+            )
+        else:
+            hard_neg_r = zero_r
+            loss_hard_neg = zero_scalar
 
-        target_mask = trans_valids
-        while target_mask.ndim < y_trans.ndim:
-            target_mask = target_mask[None, ...]
-        y_trans = jnp.clip(y_trans, 0.0, 1.0)
-        y_trans = jnp.where(target_mask > 0, y_trans, 0.0)
-        loss_trans = masked_mean(self.bce_loss(r_logits, y_trans), trans_valids)
-        loss_pos = self.bce_loss(r_logits, jnp.ones_like(r_logits)).mean()
+        if compute_rand_hinge:
+            rand_logits = self.critic_logits_for(
+                batch["observations"],
+                batch["actions"],
+                batch["value_random_goals"],
+                batch["value_random_budgets"],
+                grad_params=grad_params,
+            )
+            rand_r = jax.nn.sigmoid(rand_logits)
+            loss_rand_hinge = jnp.mean(
+                jnp.maximum(rand_r - self.config["rand_hinge_rho"], 0.0) ** 2
+            )
+        else:
+            rand_r = zero_r
+            loss_rand_hinge = zero_scalar
 
-        neg_logits = self.critic_logits_for(
-            batch["observations"],
-            batch["actions"],
-            batch[goal_key],
-            batch["value_neg_budgets"],
-            offsets=batch.get("value_offsets"),
-            grad_params=grad_params,
-        )
-        neg_r = jax.nn.sigmoid(neg_logits)
-        loss_budget_neg = masked_mean(
-            self.bce_loss(neg_logits, jnp.zeros_like(neg_logits)),
-            batch["value_neg_valids"],
-        )
+        if compute_mono:
+            low_logits = self.critic_logits_for(
+                batch["observations"],
+                batch["actions"],
+                batch[goal_key],
+                batch["mono_low_budgets"],
+                offsets=batch.get("value_offsets"),
+                grad_params=grad_params,
+            )
+            high_logits = self.critic_logits_for(
+                batch["observations"],
+                batch["actions"],
+                batch[goal_key],
+                batch["mono_high_budgets"],
+                offsets=batch.get("value_offsets"),
+                grad_params=grad_params,
+            )
+            low_r = jax.nn.sigmoid(low_logits)
+            high_r = jax.nn.sigmoid(high_logits)
+            loss_mono = jnp.mean(jnp.maximum(low_r - high_r, 0.0) ** 2)
+        else:
+            low_r = zero_r
+            high_r = zero_r
+            loss_mono = zero_scalar
 
-        hard_neg_logits = self.critic_logits_for(
-            batch["observations"],
-            batch["actions"],
-            batch["value_hard_neg_goals"],
-            batch["value_hard_neg_budgets"],
-            offsets=batch.get("value_hard_neg_offsets"),
-            grad_params=grad_params,
-        )
-        hard_neg_r = jax.nn.sigmoid(hard_neg_logits)
-        loss_hard_neg = masked_mean(
-            self.bce_loss(hard_neg_logits, jnp.zeros_like(hard_neg_logits)),
-            batch["value_hard_neg_valids"],
-        )
-
-        rand_logits = self.critic_logits_for(
-            batch["observations"],
-            batch["actions"],
-            batch["value_random_goals"],
-            batch["value_random_budgets"],
-            grad_params=grad_params,
-        )
-        rand_r = jax.nn.sigmoid(rand_logits)
-        loss_rand_hinge = jnp.mean(
-            jnp.maximum(rand_r - self.config["rand_hinge_rho"], 0.0) ** 2
-        )
-
-        low_logits = self.critic_logits_for(
-            batch["observations"],
-            batch["actions"],
-            batch[goal_key],
-            batch["mono_low_budgets"],
-            offsets=batch.get("value_offsets"),
-            grad_params=grad_params,
-        )
-        high_logits = self.critic_logits_for(
-            batch["observations"],
-            batch["actions"],
-            batch[goal_key],
-            batch["mono_high_budgets"],
-            offsets=batch.get("value_offsets"),
-            grad_params=grad_params,
-        )
-        low_r = jax.nn.sigmoid(low_logits)
-        high_r = jax.nn.sigmoid(high_logits)
-        loss_mono = jnp.mean(jnp.maximum(low_r - high_r, 0.0) ** 2)
-
-        if "value_sup_goals" in batch:
+        if compute_sup and "value_sup_goals" in batch:
             sup_logits = self.critic_logits_for_pair_grid(
                 batch["value_sup_observations"],
                 batch["value_sup_actions"],
@@ -373,7 +432,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             sup_r = jnp.zeros_like(sup_logits)
             loss_sup = jnp.asarray(0.0, dtype=r_logits.dtype)
 
-        if "value_rank_goals" in batch:
+        if compute_rank and "value_rank_goals" in batch:
             rank_pos_logits = self.critic_logits_for_pair_grid(
                 batch["value_rank_observations"],
                 batch["value_rank_actions"],
@@ -467,7 +526,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             "rank_valid_frac": rank_valids.mean(),
         }
 
-        if "value_sup_goals" in batch:
+        if compute_sup and "value_sup_goals" in batch:
             for budget in config_budgets(self.config):
                 budget_mask = (
                     jnp.asarray(batch["value_sup_budgets"]) == int(budget)
@@ -702,14 +761,57 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
                 n_actions = n_actions + vels / pe_info["flow_steps"]
             n_actions = jnp.clip(n_actions, -1, 1)
 
-            aug_n_goals = self.augment_goal(
-                n_goals,
-                actor_budget(n_goals, self.config["max_budget"]),
-            )
-            q = self.network.select("critic")(
-                n_observations, goals=aug_n_goals, actions=n_actions
-            )
-            q = jnp.min(q, axis=0)
+            if self.config.get("actor_budget_mode", "max") == "scan":
+                budgets = jnp.asarray(config_budgets(self.config), dtype=jnp.float32)
+                candidate_shape = n_actions.shape[:-1]
+                scan_shape = (budgets.shape[0],) + candidate_shape
+                scan_observations = jnp.broadcast_to(
+                    n_observations[None, ...],
+                    scan_shape + observations.shape[-1:],
+                )
+                scan_goals = jnp.broadcast_to(
+                    n_goals[None, ...],
+                    scan_shape + goals.shape[-1:],
+                )
+                scan_actions = jnp.broadcast_to(
+                    n_actions[None, ...],
+                    scan_shape + n_actions.shape[-1:],
+                )
+                scan_budgets = jnp.broadcast_to(
+                    budgets.reshape((budgets.shape[0],) + (1,) * len(candidate_shape)),
+                    scan_shape,
+                )
+                logits = self.critic_logits_for_pair_grid(
+                    scan_observations,
+                    scan_actions,
+                    scan_goals,
+                    scan_budgets,
+                )
+                probs = jax.nn.sigmoid(logits)
+                probs = jnp.min(probs, axis=0)
+                threshold = float(self.config.get("actor_budget_threshold", 0.5))
+                fallback_budget = float(self.config["max_budget"]) * 2.0
+                feasible_budgets = jnp.where(
+                    probs >= threshold,
+                    scan_budgets,
+                    fallback_budget,
+                )
+                first_feasible_budget = feasible_budgets.min(axis=0)
+                best_prob = probs.max(axis=0)
+                prob_weight = float(
+                    self.config.get("actor_budget_scan_prob_weight", 0.01)
+                )
+                q = -first_feasible_budget / float(self.config["max_budget"])
+                q = q + prob_weight * best_prob
+            else:
+                aug_n_goals = self.augment_goal(
+                    n_goals,
+                    actor_budget(n_goals, self.config["max_budget"]),
+                )
+                q = self.network.select("critic")(
+                    n_observations, goals=aug_n_goals, actions=n_actions
+                )
+                q = jnp.min(q, axis=0)
 
             if len(observations.shape) == 2:
                 actions = n_actions[
@@ -817,6 +919,16 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             budget_feature=config["budget_feature"],
             oracle_offset_feature=config.get("oracle_offset_feature", False),
         )
+        if config.get("critic_absdiff_goal_feature", False):
+            if ex_observations.shape[-1] != ex_goals.shape[-1]:
+                raise ValueError(
+                    "critic_absdiff_goal_feature requires matching observation "
+                    f"and goal dims, got {ex_observations.shape[-1]} and "
+                    f"{ex_goals.shape[-1]}."
+                )
+            ex_critic_goals = jnp.concatenate(
+                [ex_critic_goals, jnp.abs(ex_observations - ex_goals)], axis=-1
+            )
         critic_in = (
             (ex_observations, ex_critic_goals)
             if critic_mode == "state"
@@ -890,9 +1002,11 @@ def get_config():
             rand_hinge_rho=0.3,
             actor_budget_mode="max",
             actor_budget_threshold=0.5,
+            actor_budget_scan_prob_weight=0.01,
             diagnostic_critic_mode="action",
             value_only=False,
             oracle_offset_feature=False,
+            critic_absdiff_goal_feature=False,
             dataset=mlc.ConfigDict(
                 dict(
                     dataset_class="GCDataset",

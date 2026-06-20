@@ -105,6 +105,28 @@ def main():
     assert one_batch_action.shape == batch["actions"][:1].shape
     assert bool(jnp.all(jnp.isfinite(one_batch_action)))
 
+    scan_config = make_config()
+    scan_config.actor_budget_mode = "scan"
+    scan_dataset = GCDataset(make_fake_dataset(), scan_config)
+    scan_example_batch = scan_dataset.sample(1)
+    scan_batch = scan_dataset.sample(scan_config.batch_size)
+    scan_agent = BMMTRLAgent.create(9, scan_example_batch, scan_config)
+    scan_agent, _ = scan_agent.update(scan_batch)
+    scan_actions = scan_agent.sample_actions(
+        scan_batch["observations"],
+        goals=scan_batch["actor_goals"],
+        seed=jax.random.PRNGKey(9),
+    )
+    assert scan_actions.shape == scan_batch["actions"].shape
+    assert bool(jnp.all(jnp.isfinite(scan_actions)))
+    scan_single_action = scan_agent.sample_actions(
+        scan_batch["observations"][0],
+        goals=scan_batch["actor_goals"][0],
+        seed=jax.random.PRNGKey(10),
+    )
+    assert scan_single_action.shape == scan_batch["actions"][0].shape
+    assert bool(jnp.all(jnp.isfinite(scan_single_action)))
+
     zero_config = make_config()
     zero_config.lambda_hard_neg = 0.0
     zero_config.lambda_rank = 0.0
@@ -126,6 +148,21 @@ def main():
     _, onehot_info = onehot_agent.update(onehot_batch)
     assert "critic/loss_sup" in onehot_info
     for key, value in onehot_info.items():
+        assert bool(jnp.all(jnp.isfinite(value))), f"Non-finite metric {key}: {value}"
+
+    absdiff_config = make_config()
+    absdiff_config.diagnostic_critic_mode = "state"
+    absdiff_config.value_only = True
+    absdiff_config.lambda_rank = 0.0
+    absdiff_config.num_rank_pairs = 0
+    absdiff_config.critic_absdiff_goal_feature = True
+    absdiff_dataset = GCDataset(make_fake_dataset(), absdiff_config)
+    absdiff_example_batch = absdiff_dataset.sample(1)
+    absdiff_batch = absdiff_dataset.sample(absdiff_config.batch_size)
+    absdiff_agent = BMMTRLAgent.create(11, absdiff_example_batch, absdiff_config)
+    _, absdiff_info = absdiff_agent.update(absdiff_batch)
+    assert "critic/loss_sup" in absdiff_info
+    for key, value in absdiff_info.items():
         assert bool(jnp.all(jnp.isfinite(value))), f"Non-finite metric {key}: {value}"
 
     state_config = make_config()

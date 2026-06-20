@@ -12,3 +12,14 @@ ipynbs/
 data/
 slurm_outputs/
 scripts/bmm_tabular_errors.png
+
+# LaTeX build artifacts.
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+paper/bmm_trl/main.pdf

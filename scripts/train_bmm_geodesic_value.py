@@ -23,14 +23,22 @@ from utils.datasets import Dataset, GCDataset
 from utils.flax_utils import save_agent
 from utils.pointmaze_graph import (
     adjacency_lists,
+    bin_to_state_indices,
     build_dataset_position_graph,
+    build_dataset_representation_graph,
+    build_train_support_position_graph,
+    build_train_support_representation_graph,
     dataset_xy,
+    graph_distance_matrix_cache_path,
+    graph_distance_matrix_statistics,
     graph_distance_statistics,
     graph_step_distance_matrix,
+    load_graph_distance_matrix_npz,
     load_graph_npz,
     median_step_xy,
     parse_xy_dims,
     sample_graph_budget_pairs,
+    save_graph_distance_matrix_npz,
     save_graph_npz,
     source_indices,
 )
@@ -56,6 +64,39 @@ flags.DEFINE_string(
 flags.DEFINE_string("graph_path", "exp/bmm_pointmaze_graph.npz", "Graph npz path.")
 flags.DEFINE_bool("rebuild_graph", False, "Rebuild graph labels even if graph exists.")
 flags.DEFINE_string("xy_dims", "0,1", "Comma-separated observation dims to use as xy.")
+flags.DEFINE_string(
+    "graph_rep_key",
+    "observations",
+    "Dataset key used for graph binning when reachability_label_type=graph.",
+)
+flags.DEFINE_string(
+    "graph_rep_dims",
+    "default",
+    "Comma-separated representation dims, 'all', or 'default'. Default uses xy_dims "
+    "for observations and all dims for other representation keys.",
+)
+flags.DEFINE_float(
+    "graph_bin_size_factor",
+    2.0,
+    "Graph bin size as a multiple of median one-step representation displacement.",
+)
+flags.DEFINE_integer(
+    "graph_full_distance_max_nodes",
+    5000,
+    "Compute all-pairs graph distances only up to this many nodes; <=0 always computes.",
+)
+flags.DEFINE_integer(
+    "graph_stats_sources",
+    256,
+    "Number of graph sources for sampled distance stats when all-pairs is skipped.",
+)
+flags.DEFINE_enum(
+    "graph_build_mode",
+    "train_val",
+    ["train_val", "train_only"],
+    "Graph construction mode: train_val uses train+validation support; "
+    "train_only uses train support and maps validation states to train bins.",
+)
 flags.DEFINE_enum(
     "geodesic_budget_unit",
     "env_steps",
@@ -68,6 +109,12 @@ flags.DEFINE_integer("batch_size", 256, "Training pairs per budget per update.")
 flags.DEFINE_integer("eval_pairs", 512, "Heldout pairs per budget.")
 flags.DEFINE_integer("steps", 2000, "Training updates.")
 flags.DEFINE_integer("eval_interval", 250, "Evaluate every N updates.")
+flags.DEFINE_string(
+    "critic_obs_rep_key",
+    None,
+    "Optional dataset key to use as critic observations in this diagnostic. "
+    "Currently intended for oracle_reps representation-level Puzzle smokes.",
+)
 flags.DEFINE_float(
     "pos_boundary_frac",
     0.5,
@@ -238,37 +285,96 @@ def make_grid_context(env, train_dataset, val_dataset, xy_dims):
     )
 
 
-def make_graph_context(train_dataset, val_dataset, xy_dims):
+def graph_rep_dims(xy_dims):
+    value = str(FLAGS.graph_rep_dims)
+    if value.lower() == "default":
+        if FLAGS.graph_rep_key == "observations":
+            return tuple(int(x) for x in xy_dims)
+        return None
+    return value
+
+
+def make_graph_context(train_dataset, val_dataset, xy_dims, rng):
     graph_path = Path(FLAGS.graph_path)
     if graph_path.exists() and not FLAGS.rebuild_graph:
         graph = load_graph_npz(graph_path)
     else:
-        graph = build_dataset_position_graph(
-            train_dataset,
-            val_dataset,
-            xy_dims=xy_dims,
+        dims = graph_rep_dims(xy_dims)
+        use_xy = (
+            FLAGS.graph_rep_key == "observations"
+            and dims == tuple(int(x) for x in xy_dims)
         )
+        if use_xy:
+            builder = (
+                build_train_support_position_graph
+                if FLAGS.graph_build_mode == "train_only"
+                else build_dataset_position_graph
+            )
+            graph = builder(
+                train_dataset,
+                val_dataset,
+                xy_dims=xy_dims,
+                bin_size_factor=FLAGS.graph_bin_size_factor,
+            )
+        else:
+            builder = (
+                build_train_support_representation_graph
+                if FLAGS.graph_build_mode == "train_only"
+                else build_dataset_representation_graph
+            )
+            graph = builder(
+                train_dataset,
+                val_dataset,
+                rep_key=FLAGS.graph_rep_key,
+                dims=dims,
+                bin_size_factor=FLAGS.graph_bin_size_factor,
+            )
         graph_path.parent.mkdir(parents=True, exist_ok=True)
         save_graph_npz(graph_path, graph)
     adjacency = adjacency_lists(
         len(graph["bin_centers"]), graph["edge_src"], graph["edge_dst"]
     )
-    stats = graph_distance_statistics(adjacency, graph)
-    distance_matrix = graph_step_distance_matrix(adjacency, graph)
+    full_limit = int(FLAGS.graph_full_distance_max_nodes)
+    compute_full = full_limit <= 0 or len(adjacency) <= full_limit
+    if compute_full:
+        distance_cache_path = graph_distance_matrix_cache_path(graph_path)
+        distance_matrix = load_graph_distance_matrix_npz(distance_cache_path, graph)
+        if distance_matrix is None:
+            distance_matrix = graph_step_distance_matrix(adjacency, graph)
+            save_graph_distance_matrix_npz(distance_cache_path, distance_matrix, graph)
+        stats = graph_distance_matrix_statistics(distance_matrix, graph)
+    else:
+        distance_matrix = None
+        stats = graph_distance_statistics(
+            adjacency,
+            graph,
+            max_sources=FLAGS.graph_stats_sources,
+            rng=rng,
+        )
     return dict(
         kind="graph",
         graph=graph,
         adjacency=adjacency,
         distance_matrix=distance_matrix,
         distance_stats=stats,
+        full_distance_matrix=bool(compute_full),
+        graph_full_distance_max_nodes=int(FLAGS.graph_full_distance_max_nodes),
+        train_goal_by_bin=bin_to_state_indices(
+            graph["train_state_to_bin"], len(graph["bin_centers"])
+        ),
+        val_goal_by_bin=bin_to_state_indices(
+            graph["val_state_to_bin"], len(graph["bin_centers"])
+        ),
+        train_source_idxs=source_indices(train_dataset),
+        val_source_idxs=source_indices(val_dataset),
     )
 
 
-def make_label_context(env, train_dataset, val_dataset, xy_dims):
+def make_label_context(env, train_dataset, val_dataset, xy_dims, rng):
     if FLAGS.reachability_label_type == "grid_geodesic":
         return make_grid_context(env, train_dataset, val_dataset, xy_dims)
     if FLAGS.reachability_label_type == "graph":
-        return make_graph_context(train_dataset, val_dataset, xy_dims)
+        return make_graph_context(train_dataset, val_dataset, xy_dims, rng)
     raise ValueError(
         "train_bmm_geodesic_value.py supports "
         "reachability_label_type='grid_geodesic' or 'graph'."
@@ -305,6 +411,8 @@ def sample_context_budget_pairs(dataset, context, split, budget, num_pairs, rng)
         neg_max_factor=FLAGS.neg_max_factor,
         adjacency=context["adjacency"],
         distance_matrix=context["distance_matrix"],
+        goal_by_bin=context[f"{split}_goal_by_bin"],
+        src_idxs=context[f"{split}_source_idxs"],
     )
 
 
@@ -314,7 +422,57 @@ def pair_distance(row):
     return row["graph_distances"]
 
 
-def make_sup_fields(dataset, context, split, budgets, pairs_per_budget, rng):
+def goal_vectors_for_idxs(dataset, idxs):
+    """Return goal vectors in the representation used by GCDataset."""
+    idxs = np.asarray(idxs, dtype=np.int32)
+    if "oracle_reps" in dataset:
+        return np.asarray(dataset["oracle_reps"])[idxs]
+    return np.asarray(dataset["observations"])[idxs]
+
+
+def critic_observations_for_idxs(dataset, idxs, rep_key=None):
+    """Return source observations for the diagnostic critic."""
+    idxs = np.asarray(idxs, dtype=np.int32)
+    if rep_key is None:
+        return np.asarray(dataset["observations"])[idxs]
+    if rep_key not in dataset:
+        keys = sorted(dataset._dict.keys() if hasattr(dataset, "_dict") else dataset.keys())
+        raise KeyError(f"Dataset has no critic observation key {rep_key!r}; keys: {keys}.")
+    return np.asarray(dataset[rep_key])[idxs]
+
+
+def apply_critic_obs_rep(batch, dataset, source_idxs, rep_key=None):
+    """Replace critic observation fields with a representation-space source state."""
+    if rep_key is None:
+        return batch
+    if rep_key != "oracle_reps":
+        raise ValueError(
+            "--critic_obs_rep_key currently supports oracle_reps only, because "
+            "midpoint indices are not retained in GCDataset batches."
+        )
+    batch["observations"] = critic_observations_for_idxs(dataset, source_idxs, rep_key)
+    if "value_midpoint_goals" in batch:
+        batch["value_midpoint_observations"] = np.asarray(
+            batch["value_midpoint_goals"], dtype=np.float32
+        )
+    return batch
+
+
+def row_goal_vectors(dataset, row):
+    if "goal_idxs" in row:
+        return goal_vectors_for_idxs(dataset, row["goal_idxs"])
+    return row["goals"]
+
+
+def make_sup_fields(
+    dataset,
+    context,
+    split,
+    budgets,
+    pairs_per_budget,
+    rng,
+    critic_obs_rep_key=None,
+):
     rows = []
     for budget in budgets:
         row = sample_context_budget_pairs(
@@ -334,10 +492,26 @@ def make_sup_fields(dataset, context, split, budgets, pairs_per_budget, rng):
         rows.append(row)
 
     distances = [pair_distance(row) for row in rows]
+    observations = []
+    for row in rows:
+        if critic_obs_rep_key is None:
+            observations.append(row["observations"])
+        elif "source_idxs" in row:
+            observations.append(
+                critic_observations_for_idxs(
+                    dataset, row["source_idxs"], critic_obs_rep_key
+                )
+            )
+        else:
+            raise ValueError(
+                "--critic_obs_rep_key requires sampled rows with source_idxs."
+            )
     return dict(
-        value_sup_observations=np.stack([row["observations"] for row in rows], axis=0),
+        value_sup_observations=np.stack(observations, axis=0).astype(np.float32),
         value_sup_actions=np.stack([row["actions"] for row in rows], axis=0),
-        value_sup_goals=np.stack([row["goals"] for row in rows], axis=0),
+        value_sup_goals=np.stack(
+            [row_goal_vectors(dataset, row) for row in rows], axis=0
+        ),
         value_sup_budgets=np.stack([row["budgets"] for row in rows], axis=0),
         value_sup_offsets=np.stack(
             [np.rint(distance).astype(np.int32) for distance in distances],
@@ -514,7 +688,7 @@ def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size,
         goal_idx = int(rng.choice(state_by_cell[goal_cell]))
         observations.append(np.asarray(dataset["observations"])[src_idx])
         actions.append(np.asarray(dataset["actions"])[src_idx])
-        goals.append(np.asarray(dataset["observations"])[goal_idx])
+        goals.append(goal_vectors_for_idxs(dataset, goal_idx))
         value_budgets.append(budget)
         parent_distance = float(src_distances[goal_cell])
         value_offsets.append(parent_distance)
@@ -550,7 +724,7 @@ def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size,
                 np.asarray(dataset["observations"])[witness_idx]
             )
             parent_witness_actions.append(np.asarray(dataset["actions"])[witness_idx])
-            parent_witness_goals.append(np.asarray(dataset["observations"])[witness_idx])
+            parent_witness_goals.append(goal_vectors_for_idxs(dataset, witness_idx))
             parent_witness_offsets.append(left_distance)
             parent_left_budgets.append(left_budget)
             parent_right_budgets.append(right_budget)
@@ -808,7 +982,8 @@ def score_sup_batch(agent, batch, budgets):
             continue
         obs = observations[mask]
         goal = goals[mask]
-        euclidean = np.linalg.norm(goal[:, :2] - obs[:, :2], axis=-1)
+        common_dim = min(obs.shape[-1], goal.shape[-1])
+        euclidean = np.linalg.norm(goal[:, :common_dim] - obs[:, :common_dim], axis=-1)
         row_labels = labels[mask]
         row_distances = distances[mask]
         report["budget_rows"].append(
@@ -981,6 +1156,8 @@ def context_metadata(context):
         node_count=int(len(graph["bin_centers"])),
         edge_count=int(len(graph["edge_src"])),
         distance_stats=context["distance_stats"],
+        full_distance_matrix=context["full_distance_matrix"],
+        graph_full_distance_max_nodes=context["graph_full_distance_max_nodes"],
     )
 
 
@@ -1005,7 +1182,7 @@ def main(_):
     env, train_dataset, val_dataset = make_env_and_datasets(
         FLAGS.env_name, dataset_path=dataset_path
     )
-    context = make_label_context(env, train_dataset, val_dataset, xy_dims)
+    context = make_label_context(env, train_dataset, val_dataset, xy_dims, rng)
     print("BMM geodesic value diagnostic")
     print(f"  env_name: {FLAGS.env_name}")
     print(f"  label_type: {context['kind']}")
@@ -1016,11 +1193,16 @@ def main(_):
     print(f"  trans_witness_mode: {FLAGS.trans_witness_mode}")
     print(f"  sup_pairs_per_budget: {sup_pairs_per_budget}")
     print(f"  trans_pairs_per_update: {trans_pairs_per_update}")
+    print(f"  critic_obs_rep_key: {FLAGS.critic_obs_rep_key}")
     print(f"  context: {context_metadata(context)}")
 
     dataset_class = {"GCDataset": GCDataset}[config["dataset"]["dataset_class"]]
     gc_train = dataset_class(Dataset.create(**train_dataset), config)
-    example_batch = gc_train.sample(1)
+    example_idxs = gc_train.dataset.get_random_idxs(1)
+    example_batch = gc_train.sample(1, example_idxs)
+    apply_critic_obs_rep(
+        example_batch, train_dataset, example_idxs, FLAGS.critic_obs_rep_key
+    )
     agent = agents[config["agent_name"]].create(FLAGS.seed, example_batch, config)
     if FLAGS.save_dir is not None:
         Path(FLAGS.save_dir).mkdir(parents=True, exist_ok=True)
@@ -1032,6 +1214,7 @@ def main(_):
         budgets,
         FLAGS.eval_pairs,
         rng,
+        critic_obs_rep_key=FLAGS.critic_obs_rep_key,
     )
     final_loss = None
     train_report = None
@@ -1046,7 +1229,12 @@ def main(_):
         base_batch_size = (
             trans_pairs_per_update if FLAGS.lambda_trans > 0.0 else FLAGS.batch_size
         )
-        train_batch = gc_train.sample(base_batch_size)
+        if FLAGS.critic_obs_rep_key is None:
+            train_batch = gc_train.sample(base_batch_size)
+            train_idxs = None
+        else:
+            train_idxs = gc_train.dataset.get_random_idxs(base_batch_size)
+            train_batch = gc_train.sample(base_batch_size, train_idxs)
         transitive_fields = None
         if FLAGS.lambda_trans > 0.0:
             transitive_fields = sample_grid_transitive_v_pairs(
@@ -1058,6 +1246,10 @@ def main(_):
                 rng,
             )
             train_batch.update(transitive_fields)
+        if train_idxs is not None:
+            apply_critic_obs_rep(
+                train_batch, train_dataset, train_idxs, FLAGS.critic_obs_rep_key
+            )
         train_batch.update(
             make_sup_fields(
                 train_dataset,
@@ -1066,6 +1258,7 @@ def main(_):
                 budgets,
                 sup_pairs_per_budget,
                 rng,
+                critic_obs_rep_key=FLAGS.critic_obs_rep_key,
             )
         )
         agent, info = agent.update(train_batch)
@@ -1113,6 +1306,7 @@ def main(_):
             eval_pairs=int(FLAGS.eval_pairs),
             steps=int(FLAGS.steps),
             eval_interval=int(FLAGS.eval_interval),
+            critic_obs_rep_key=FLAGS.critic_obs_rep_key,
             final_loss_sup=final_loss,
             lambda_trans=float(FLAGS.lambda_trans),
             trans_pos_boundary_frac=float(FLAGS.trans_pos_boundary_frac),
