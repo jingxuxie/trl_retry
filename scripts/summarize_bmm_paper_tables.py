@@ -82,6 +82,14 @@ DEFAULT_SCENE_QV = (
             / "exp"
             / "bmm_scene_play_trainonly_graph_qv_holdout_h64_h128_onehot_seed0_smoke"
             / "summary.json",
+            REPO_ROOT
+            / "exp"
+            / "bmm_scene_play_trainonly_graph_qv_holdout_h64_h128_onehot_seed1_smoke"
+            / "summary.json",
+            REPO_ROOT
+            / "exp"
+            / "bmm_scene_play_trainonly_graph_qv_holdout_h64_h128_onehot_seed2_smoke"
+            / "summary.json",
         ),
     ),
 )
@@ -211,10 +219,16 @@ DEFAULT_SCENE_POLICIES = (
         / "scene_play_graph_gcfbc50k_support_left32_right128_ep15_seed10_detreset.json",
     ),
     (
-        "Scene-Play local GCFBC 50k BMM, left32/right128",
+        "Scene-Play local GCFBC 50k BMM best-overall, left32/right128",
         REPO_ROOT
         / "exp"
         / "scene_play_graph_gcfbc50k_bmm_left32_right128_ep15_seed10_detreset.json",
+    ),
+    (
+        "Scene-Play local GCFBC 50k BMM task-2-safe, left32/right128",
+        REPO_ROOT
+        / "exp"
+        / "scene_play_graph_gcfbc50k_bmm_left32_right128_reset_task2_ep15_seed10_detreset.json",
     ),
 )
 
@@ -636,7 +650,7 @@ def scene_policy_section(results):
     lines.extend(
         [
             "",
-            "Scene-Play policy caveat: the 10k oracle-goal BC rows are negative boundary smokes. With the stronger 50k local GCFBC controller, direct local control is 46.7% in the 15-rollout smoke, matched support-path-only is 63/75 (84.0%), and BMM support-path is 66/75 (88.0%) over 75 rollouts. This is fixed-controller graph-subgoal evidence, not direct actor extraction.",
+            "Scene-Play policy caveat: the 10k oracle-goal BC rows are negative boundary smokes. With the stronger 50k local GCFBC controller, direct local control is 46.7% in the 15-rollout smoke, matched support-path-only is 63/75 (84.0%), BMM support-path is 66/75 (88.0%) in the best-overall artifact, and the task-2-safe BMM artifact is 65/75 (86.7%) while clearing every paper per-task entry. This is fixed-controller graph-subgoal evidence, not direct actor extraction.",
             "",
         ]
     )
@@ -655,7 +669,7 @@ def policy_limitations_section():
         "| dataset-support-gated adaptive BMM budget-scan selector | 96.0% success / zero final distance on navigate and 100.0% success on stitch | current non-oracle policy positive |",
         "| large-stitch local-progress value-frontier selector | 100.0% success / zero final distance over 15 rollouts, versus 0.0% geometric and 20.0% support-path-only in matched 15-rollout controls | positive long-horizon OGBench stitch signal, with explicit no-backtracking extraction caveat |",
         "| support-frontier/path BMM selector | 100.0% success / zero final distance on large navigate, the paper-listed oraclerep large navigate 25-rollout validation, and AntMaze-medium with a stronger fixed BC controller; large-oraclerep support-only reaches 100.0%, AntMaze-medium support-path-only reaches 93.3%, and large-AntMaze oraclerep ep5 reaches 48.0% vs 52.0% support-only under corrected right horizon 480; with a 20k oracle-goal BC controller, large-AntMaze ep3 reaches 66.7% BMM vs 80.0% support-only under the older switch80 protocol; the current best fixed-reset switch40 protocol reaches 86.7% (13/15) with support-path primary plus delayed learned BMM right-progress repair versus 80.0% support-path-only; focused BMM-primary delayed repair still reaches only 1/3 on task 5 | current non-oracle long-horizon policy positive with support-only caveat; large-AntMaze is good enough to freeze as a learned-repair milestone, but the claim is support-path planning plus delayed BMM repair rather than robust pure BMM-primary extraction |",
-        "| Scene-Play graph-subgoal BC | BMM support-path reaches 66/75 versus matched support-path-only 63/75 and direct local GCFBC 46.7% in the 15-rollout smoke; task 5 remains weak | positive fixed-controller graph-subgoal evidence with modest BMM margin; not direct actor extraction |",
+        "| Scene-Play graph-subgoal BC | BMM support-path reaches 66/75 in the best-overall artifact and 65/75 in the promoted task-2-safe artifact, versus matched support-path-only 63/75 and direct local GCFBC 46.7% in the 15-rollout smoke; task 5 remains weak | positive fixed-controller graph-subgoal evidence with modest BMM margin; not direct actor extraction |",
         "| grid-geodesic oracle-gated selector | matched or upper-bounded support gating in the smokes | oracle comparator only |",
         "| full left/right gate on large navigate | fails when remaining distance exceeds the largest reliable right-budget classifier | motivates support-frontier interface |",
         "",

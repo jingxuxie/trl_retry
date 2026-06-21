@@ -15,6 +15,20 @@ OUT_MD = REPO_ROOT / "exp" / "antsoccer_arena_artifact_audit.md"
 
 CANONICAL_PROTOCOLS = [
     {
+        "label": "best fixed-actor BMM protocol",
+        "kind": "single_artifact",
+        "selector": "BMM_support_path",
+        "artifact": "exp/antsoccer_arena_graph_trl1m_bmm_switch64_commit10_task14switch128_task5switch48_ep15_seed10_detreset.json",
+        "caveat": "BMM graph subgoals with the fixed 1M paper-style TRL/RPG actor, subgoal_commit_steps=10, task-1/task-4 final-goal switches of 128, and a task-5 final-goal switch of 48.",
+    },
+    {
+        "label": "matched fixed-actor support-path control",
+        "kind": "single_artifact",
+        "selector": "support_path_only",
+        "artifact": "exp/antsoccer_arena_graph_trl1m_support_switch64_commit10_task14switch128_task5switch48_ep15_seed10_detreset.json",
+        "caveat": "Same fixed 1M TRL/RPG actor and the same task-specific final-goal switch distances, but without BMM value ranking.",
+    },
+    {
         "label": "best clean single protocol",
         "kind": "single_artifact",
         "selector": "support_path_only",
@@ -268,10 +282,19 @@ def build_audit() -> dict[str, Any]:
         "full_artifacts": full_rows,
         "fifteen_episode_artifacts": task_rows,
         "conclusion": (
-            "No saved AntSoccer artifact contains a 66/75 result. The best full "
-            "artifact is 58/75 and is a task-routed support-only run. The best "
-            "clean single protocol is 52/75, the best full BMM single artifact is "
-            "44/75, and the best BMM-including routed suite is 55/75."
+            "The best saved AntSoccer artifact is now 68/75: BMM graph subgoals "
+            "with the fixed 1M paper-style TRL/RPG actor, task-1/task-4 "
+            "final-goal switches of 128, and a task-5 final-goal switch of 48. "
+            "The matched support-path control with the same fixed actor and "
+            "switch schedule is 59/75 on the promoted offset-0 block. Heldout "
+            "offset blocks are mixed but still favor BMM overall: offsets "
+            "0/15/30 give 192/225 for BMM versus 182/225 for matched support. "
+            "The previous promoted task-1-only switch row and its RNG-reset "
+            "controls remain at 65/75; budget and switch controls stayed at "
+            "or below 65/75. The older task-routed "
+            "support-only run remains 58/75. The best local-GCFBC clean single "
+            "protocol is 52/75, the best local-GCFBC full BMM single artifact is "
+            "44/75, and the older local-GCFBC BMM-including routed suite is 55/75."
         ),
     }
 

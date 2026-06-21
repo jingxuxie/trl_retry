@@ -22,14 +22,25 @@ def finite_float(value):
     return value if np.isfinite(value) else float("nan")
 
 
-def load_successes(path):
+def load_successes(path, selector_name=None):
     if path is None:
         return {}, None
     result = json.loads(Path(path).read_text())
-    name = result["selectors"][0]["name"]
+    selectors = result["selectors"]
+    if selector_name is None:
+        selector = selectors[0]
+    else:
+        matches = [item for item in selectors if item.get("name") == selector_name]
+        if not matches:
+            names = ", ".join(item.get("name", "<unnamed>") for item in selectors)
+            raise ValueError(
+                f"Selector {selector_name!r} not found in {path}. Available: {names}"
+            )
+        selector = matches[0]
+    name = selector["name"]
     return {
         (int(row["task"]), int(row["episode"])): float(row["success"])
-        for row in result["selectors"][0]["episodes"]
+        for row in selector["episodes"]
     }, name
 
 
@@ -246,7 +257,9 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--seed_global_reset_noise", action="store_true")
     parser.add_argument("--bmm_result_json", default=None)
+    parser.add_argument("--bmm_result_selector", default=None)
     parser.add_argument("--support_result_json", default=None)
+    parser.add_argument("--support_result_selector", default=None)
     parser.add_argument("--bc_layer_norm", action="store_true")
     parser.add_argument("--output_json", required=True)
     args = parser.parse_args(argv)
@@ -275,8 +288,12 @@ def main(argv=None):
         controller_agent=None,
     )
 
-    bmm_successes, bmm_name = load_successes(args.bmm_result_json)
-    support_successes, support_name = load_successes(args.support_result_json)
+    bmm_successes, bmm_name = load_successes(
+        args.bmm_result_json, args.bmm_result_selector
+    )
+    support_successes, support_name = load_successes(
+        args.support_result_json, args.support_result_selector
+    )
     task_ids = scene_eval.parse_int_list(args.task_ids)
     rows = []
     for task_id in task_ids:

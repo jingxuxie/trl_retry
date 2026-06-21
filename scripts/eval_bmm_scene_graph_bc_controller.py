@@ -437,6 +437,7 @@ class SceneGraphPolicy:
             "start_distance_gate_bmm_support",
             "start_distance_deltay_gate_bmm_support",
             "start_distance_cross_gate_bmm_support",
+            "source_x_gate_bmm_support",
         ):
             selector = "BMM_support_path"
         source_bin = self.rep_to_bin(current_rep)
@@ -504,6 +505,34 @@ class SceneGraphPolicy:
             bmm = np.full(len(bins), np.nan, dtype=np.float32)
             scores = -path_cost
             chosen = int(np.argmax(scores))
+        elif selector == "support_saturation_bmm":
+            support_scores = -path_cost
+            support_chosen = int(np.argmax(support_scores))
+            support_bin = int(bins[support_chosen])
+            support_left = self.graph_distance(source_bin, support_bin)
+            support_right = self.graph_distance(support_bin, goal_bin)
+            use_bmm = (
+                np.isfinite(support_left)
+                and np.isfinite(support_right)
+                and support_left
+                >= float(self.left_budget) - float(self.args.support_saturation_source_margin)
+                and support_right >= float(self.args.support_saturation_min_right)
+            )
+            if use_bmm:
+                bmm = self.bmm_scores(
+                    observation,
+                    current_rep,
+                    final_goal_rep,
+                    bins,
+                    self.left_budget,
+                    self.right_budget,
+                )
+                scores = -path_cost + float(self.args.bmm_tiebreak_weight) * bmm
+                chosen = int(np.argmax(scores))
+            else:
+                bmm = np.full(len(bins), np.nan, dtype=np.float32)
+                scores = support_scores
+                chosen = support_chosen
         elif selector == "BMM_support_path":
             bmm = self.bmm_scores(
                 observation,
@@ -618,8 +647,16 @@ def aggregate(rows):
 def evaluate_selector(env, policy, task_ids, episodes_per_task, max_steps, args):
     rows = []
     task_switch_overrides = parse_task_float_map(args.task_final_goal_switch_distances)
+    task_commit_overrides = {
+        int(task_id): int(round(value))
+        for task_id, value in parse_task_float_map(args.task_subgoal_commit_steps).items()
+    }
     reset_controller_rng_task_ids = parse_task_set(args.reset_controller_rng_task_ids)
     for task_id in task_ids:
+        commit_steps = max(
+            1,
+            int(task_commit_overrides.get(int(task_id), int(args.subgoal_commit_steps))),
+        )
         if bool(args.reset_controller_rng_each_task) or int(task_id) in reset_controller_rng_task_ids:
             policy.controller_rng = jax.random.PRNGKey(int(args.seed) + 991)
         for ep in range(int(episodes_per_task)):
@@ -651,12 +688,15 @@ def evaluate_selector(env, policy, task_ids, episodes_per_task, max_steps, args)
                 "start_distance_gate_bmm_support",
                 "start_distance_deltay_gate_bmm_support",
                 "start_distance_cross_gate_bmm_support",
+                "source_x_gate_bmm_support",
             ):
                 force_bmm_tasks = parse_task_set(args.route_force_bmm_task_ids)
                 use_bmm_route = (
                     np.isfinite(start_graph_d)
                     and start_graph_d >= float(args.route_bmm_min_start_graph_d)
                 )
+                if policy.selector == "source_x_gate_bmm_support":
+                    use_bmm_route = float(start_rep[0]) >= float(args.route_bmm_min_source_x)
                 if policy.selector in (
                     "start_distance_deltay_gate_bmm_support",
                     "start_distance_cross_gate_bmm_support",
@@ -764,6 +804,7 @@ def evaluate_selector(env, policy, task_ids, episodes_per_task, max_steps, args)
                         "start_distance_gate_bmm_support",
                         "start_distance_deltay_gate_bmm_support",
                         "start_distance_cross_gate_bmm_support",
+                        "source_x_gate_bmm_support",
                     ):
                         selector_override = start_route_selector
                     active = policy.select_goal(
@@ -773,7 +814,7 @@ def evaluate_selector(env, policy, task_ids, episodes_per_task, max_steps, args)
                         final_goal_switch_distance=switch_distance,
                         selector_override=selector_override,
                     )
-                    active_until = step + max(1, int(args.subgoal_commit_steps))
+                    active_until = step + commit_steps
                     choices.append(active)
                     saw_direct_choice = saw_direct_choice or bool(active.get("direct", False))
                     if bool(args.record_choices):
@@ -829,7 +870,7 @@ def evaluate_selector(env, policy, task_ids, episodes_per_task, max_steps, args)
                                 else None
                             ),
                         )
-                        active_until = step + max(1, int(args.subgoal_commit_steps))
+                        active_until = step + commit_steps
                         choices.append(active)
                         saw_direct_choice = saw_direct_choice or bool(active.get("direct", False))
                         if bool(args.record_choices):
@@ -911,6 +952,7 @@ def evaluate_selector(env, policy, task_ids, episodes_per_task, max_steps, args)
                         for c in choices
                     ]
                 ),
+                subgoal_commit_steps=float(commit_steps),
                 map_fallback_frac=float((policy.map_fallback_count) / max(map_queries1, 1)),
                 map_fail_frac=float((policy.map_fail_count) / max(map_queries1, 1)),
                 wall_s=float(time.time() - t0),
@@ -994,6 +1036,14 @@ def main(argv=None):
     parser.add_argument("--pad_score_batches", action="store_true")
     parser.add_argument("--bmm_tiebreak_weight", type=float, default=0.05)
     parser.add_argument("--subgoal_commit_steps", type=int, default=20)
+    parser.add_argument(
+        "--task_subgoal_commit_steps",
+        default="",
+        help=(
+            "Optional comma-separated TASK:STEPS overrides for subgoal commit "
+            "lengths, e.g. '4:20,5:10'. Empty keeps --subgoal_commit_steps."
+        ),
+    )
     parser.add_argument("--subgoal_replan_distance", type=float, default=16.0)
     parser.add_argument("--final_goal_switch_distance", type=float, default=16.0)
     parser.add_argument(
@@ -1019,6 +1069,8 @@ def main(argv=None):
     parser.add_argument("--support_recovery_patience_steps", type=int, default=0)
     parser.add_argument("--support_recovery_switch_distance", type=float, default=128.0)
     parser.add_argument("--support_recovery_min_delta", type=float, default=32.0)
+    parser.add_argument("--support_saturation_source_margin", type=float, default=0.0)
+    parser.add_argument("--support_saturation_min_right", type=float, default=0.0)
     parser.add_argument("--bmm_no_direct_patience_steps", type=int, default=0)
     parser.add_argument("--route_bmm_min_start_graph_d", type=float, default=1480.0)
     parser.add_argument("--route_bmm_min_source_x", type=float, default=50.0)
@@ -1174,6 +1226,7 @@ def main(argv=None):
         pad_score_batches=bool(args.pad_score_batches),
         bmm_tiebreak_weight=float(args.bmm_tiebreak_weight),
         subgoal_commit_steps=int(args.subgoal_commit_steps),
+        task_subgoal_commit_steps=str(args.task_subgoal_commit_steps),
         subgoal_replan_distance=float(args.subgoal_replan_distance),
         task_ids=task_ids,
         episodes_per_task=int(args.episodes_per_task),

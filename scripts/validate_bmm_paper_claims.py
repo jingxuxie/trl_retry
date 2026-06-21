@@ -126,6 +126,14 @@ def require_text(path: Path, snippets: list[str]) -> None:
         raise AssertionError(f"{path.relative_to(REPO_ROOT)} is missing:\n{joined}")
 
 
+def forbid_text(path: Path, snippets: list[str]) -> None:
+    text = normalize_surface(path.read_text())
+    present = [snippet for snippet in snippets if snippet in text]
+    if present:
+        joined = "\n".join(f"- {item}" for item in present)
+        raise AssertionError(f"{path.relative_to(REPO_ROOT)} has stale text:\n{joined}")
+
+
 def validate_value_tables(paper_data: dict) -> None:
     checks = [
         ("grid-cell H8", "B-A", 0.0149790446, 0.0751437097, -0.3609477125),
@@ -155,8 +163,8 @@ def validate_value_tables(paper_data: dict) -> None:
     scene_checks = [
         ("Scene-Play train+val graph H128", "B_no_parent_qv_trans", 0.8177185059, 0.2355064240),
         ("Scene-Play train+val graph H128", "P_no_parent_product_qv", 0.8128967285, 0.1969177391),
-        ("Scene-Play train-only graph H128", "B_no_parent_qv_trans", 0.7235107422, 0.1365489668),
-        ("Scene-Play train-only graph H128", "P_no_parent_product_qv", 0.7205200195, 0.1149664565),
+        ("Scene-Play train-only graph H128", "B_no_parent_qv_trans", 0.7617797852, 0.1895935321),
+        ("Scene-Play train-only graph H128", "P_no_parent_product_qv", 0.7567749023, 0.1562584981),
     ]
     for label, variant, auc, gap in scene_checks:
         row = find_scene_qv(paper_data, label, variant)
@@ -172,11 +180,11 @@ def validate_advanced_rows(advanced_data: dict) -> None:
         ("puzzle-4x6-play-oraclerep-v0", 51.0, 92.0, 69, 75, "exact discrete"),
         ("humanoidmaze-medium-navigate-oraclerep-v0", 57.0, 94.6667, 71, 75, "official 2000-step"),
         ("humanoidmaze-large-navigate-oraclerep-v0", 8.0, 89.3333, 67, 75, "official 2000-step"),
-        ("humanoidmaze-giant-navigate-oraclerep-v0", 79.0, 80.0, 60, 75, "calibrated"),
-        ("scene-play-oraclerep-v0", 77.0, 88.0, 66, 75, "matched support-path-only 63/75"),
+        ("humanoidmaze-giant-navigate-oraclerep-v0", 79.0, 82.6667, 62, 75, "subgoal_commit_steps=10"),
+        ("scene-play-oraclerep-v0", 77.0, 86.6667, 65, 75, "task-2-only controller RNG reset"),
         ("cube-single-play-oraclerep-v0", 95.0, 98.6667, 74, 75, "Standard Table-2"),
         ("cube-double-play-oraclerep-v0", 30.0, 73.3333, 55, 75, "dynamic block"),
-        ("antsoccer-arena-navigate-oraclerep-v0", 73.0, 77.3333, 58, 75, "task-5-specific"),
+        ("antsoccer-arena-navigate-oraclerep-v0", 73.0, 90.6667, 68, 75, "fixed 1M paper-style TRL/RPG"),
     ]
     for env, paper, success, successes, episodes, caveat in checks:
         row = find_advanced(advanced_data, env)
@@ -194,8 +202,27 @@ def validate_advanced_rows(advanced_data: dict) -> None:
     giant = find_advanced(advanced_data, "humanoidmaze-giant-navigate-oraclerep-v0")
     heldout = giant.get("heldout", [])
     heldout_successes = [(int(item["successes"]), int(item["episodes"])) for item in heldout]
-    if heldout_successes != [(13, 15), (12, 15), (12, 15), (12, 15)]:
+    if heldout_successes != [
+        (13, 15),
+        (12, 15),
+        (12, 15),
+        (12, 15),
+        (12, 15),
+        (8, 15),
+    ]:
         raise AssertionError(f"Unexpected giant heldout smokes: {heldout_successes}")
+    diagnostic = giant.get("diagnostic", [])
+    diagnostic_successes = [(int(item["successes"]), int(item["episodes"])) for item in diagnostic]
+    if diagnostic_successes != [
+        (12, 15),
+        (13, 15),
+        (13, 15),
+        (11, 15),
+        (14, 15),
+        (13, 15),
+        (14, 15),
+    ]:
+        raise AssertionError(f"Unexpected giant diagnostic smokes: {diagnostic_successes}")
 
     scene_support = scene_graph_success(
         "exp/scene_play_graph_gcfbc50k_support_left32_right128_ep15_seed10_detreset.json"
@@ -210,7 +237,7 @@ def validate_coverage_audit(coverage_data: dict) -> None:
         "promoted_rows": 10,
         "promoted_overall_beat_or_match": 10,
         "promoted_rows_with_paper_per_task": 9,
-        "promoted_rows_all_per_tasks_beat_or_match": 6,
+        "promoted_rows_all_per_tasks_beat_or_match": 8,
         "non_promoted_rows": 1,
         "non_promoted_overall_beat_or_match": 0,
     }
@@ -225,9 +252,7 @@ def validate_coverage_audit(coverage_data: dict) -> None:
         if row["paper_per_task_available"] and row["per_task_gaps"]
     }
     expected_gap_tasks = {
-        "humanoidmaze-giant-navigate-oraclerep-v0": [1, 2, 4],
-        "scene-play-oraclerep-v0": [2],
-        "antsoccer-arena-navigate-oraclerep-v0": [2, 3],
+        "humanoidmaze-giant-navigate-oraclerep-v0": [4, 5],
     }
     if set(gap_rows) != set(expected_gap_tasks):
         raise AssertionError(f"Unexpected per-task gap rows: {sorted(gap_rows)}")
@@ -247,6 +272,8 @@ def validate_coverage_audit(coverage_data: dict) -> None:
 
 def validate_antsoccer_audit(antsoccer_data: dict) -> None:
     expected = {
+        "best fixed-actor BMM protocol": (68, 75, 90.6667),
+        "matched fixed-actor support-path control": (59, 75, 78.6666666667),
         "best clean single protocol": (52, 75, 69.3333333333),
         "best task-routed support-only artifact": (58, 75, 77.3333333333),
         "best full BMM single artifact": (44, 75, 58.6666666667),
@@ -264,10 +291,12 @@ def validate_antsoccer_audit(antsoccer_data: dict) -> None:
             )
         assert_close(f"{label} success", row["success"], success, tol=1e-3)
     top = antsoccer_data["full_artifacts"][0]
-    if int(top["successes"]) != 58 or top["selector"] != "support_path_only":
+    if int(top["successes"]) != 68 or top["selector"] != "BMM_support_path":
         raise AssertionError(f"Unexpected best full AntSoccer artifact: {top}")
-    if "No saved AntSoccer artifact contains a 66/75 result" not in antsoccer_data["conclusion"]:
-        raise AssertionError("AntSoccer audit conclusion must explicitly rule out 66/75.")
+    if "fixed 1M paper-style TRL/RPG actor" not in antsoccer_data["conclusion"]:
+        raise AssertionError("AntSoccer audit conclusion must mention the fixed-actor BMM result.")
+    if "192/225 for BMM versus 182/225 for matched support" not in antsoccer_data["conclusion"]:
+        raise AssertionError("AntSoccer audit conclusion must mention the heldout support control.")
 
 
 def validate_generated_markdown() -> None:
@@ -277,8 +306,9 @@ def validate_generated_markdown() -> None:
             "## Heldout Selector Smokes",
             "86.7% (13/15)",
             "80.0% (12/15)",
-            "BMM is 66/75 versus matched support-path-only 63/75",
-            "`antsoccer-arena-navigate-oraclerep-v0` | 73.0% | 77.3% (58/75)",
+            "task-2-only controller RNG reset reaches 65/75",
+            "best-overall BMM artifact remains 66/75",
+            "`antsoccer-arena-navigate-oraclerep-v0` | 73.0% | 90.7% (68/75)",
             "start_distance_deltay_gate_bmm_support",
         ],
     )
@@ -286,18 +316,16 @@ def validate_generated_markdown() -> None:
         COVERAGE_MD,
         [
             "promoted rows beating/matching paper overall | 10/10",
-            "promoted rows beating/matching every available per-task entry | 6/9",
-            "`antsoccer-arena-navigate-oraclerep-v0` | 73.0% | 77.3% (58/75)",
+            "promoted rows beating/matching every available per-task entry | 8/9",
+            "`antsoccer-arena-navigate-oraclerep-v0` | 73.0% | 90.7% (68/75)",
             "`antsoccer-arena-navigate-oraclerep-v0` | 73.0% | 69.3% (52/75)",
-            "task 1: 53.3% vs 71.0%, task 2: 80.0% vs 87.0%, task 4: 93.3% vs 94.0%",
-            "task 2: 93.3% vs 95.0%",
-            "task 2: 66.7% vs 85.0%, task 3: 80.0% vs 89.0%",
+            "task 4: 86.7% vs 94.0%, task 5: 93.3% vs 99.0%",
         ],
     )
     require_text(
         ANTSOCCER_MD,
         [
-            "No saved AntSoccer artifact contains a 66/75 result",
+            "best fixed-actor BMM protocol | 90.7% (68/75)",
             "best clean single protocol | 69.3% (52/75)",
             "best task-routed support-only artifact | 77.3% (58/75)",
             "best full BMM single artifact | 58.7% (44/75)",
@@ -315,11 +343,16 @@ def validate_surface_text() -> None:
             "scripts/summarize_advanced_policy_table.py",
             "scripts/audit_bmm_paper_task_coverage.py",
             "scripts/audit_antsoccer_artifacts.py",
+            "## Scene-Play Train-Only Q/V Holdout",
+            "exp/bmm_scene_play_trainonly_graph_qv_holdout_h64_h128_onehot_seed${seed}_smoke",
+            "--graph_path exp/bmm_scene_play_oraclerep_trainonly_graph_factor8.npz",
+            "--value_restore_path exp/bmm_scene_play_oraclerep_trainonly_graph_factor8_value_onehot_16_32_64_128_500",
+            "--value_hidden_dims '(1024, 1024, 1024, 1024)'",
             "exp/scene_play_graph_gcfbc50k_bmm_left32_right128_ep15_seed10_detreset.json",
             "exp/scene_play_graph_gcfbc50k_support_left32_right128_ep15_seed10_detreset.json",
             "scripts/eval_puzzle_lightsout_policy.py",
             "scripts/eval_cube_sequential_policy.py",
-            "exp/antsoccer_arena_graph_gcfbc100k_support_switch64_task5switch16_resettask5_ep15_seed10_detreset.json",
+            "exp/antsoccer_arena_graph_trl1m_bmm_switch64_commit10_task14switch128_task5switch48_ep15_seed10_detreset.json",
         ],
     )
     hard_rows = [
@@ -328,17 +361,21 @@ def validate_surface_text() -> None:
             "puzzle-4x6-play-oraclerep | 51.0% | 92.0% (69/75)",
             "humanoidmaze-medium-navigate-oraclerep | 57.0% | 94.7% (71/75)",
             "humanoidmaze-large-navigate-oraclerep | 8.0% | 89.3% (67/75)",
-            "humanoidmaze-giant-navigate-oraclerep | 79.0% | 80.0% (60/75)",
-            "scene-play-oraclerep | 77.0% | 88.0% (66/75)",
-            "matched support-path-only 63/75",
+            "humanoidmaze-giant-navigate-oraclerep | 79.0% | 82.7% (62/75)",
+            "scene-play-oraclerep | 77.0% | 86.7% (65/75)",
+            "task-2-only controller RNG reset reaches 65/75",
             "cube-single-play-oraclerep | 95.0% | 98.7% (74/75)",
             "cube-double-play-oraclerep | 30.0% | 73.3% (55/75)",
-            "antsoccer-arena-navigate-oraclerep | 73.0% | 77.3% (58/75)",
-            "heldout offset smokes reach 13/15, 12/15, 12/15, and 12/15",
+            "antsoccer-arena-navigate-oraclerep | 73.0% | 90.7% (68/75)",
+            "heldout offset smokes reach 13/15, 12/15, 12/15, 12/15, and 12/15, before an offset-30 stress test drops to 8/15",
+            "14/15 with their oracle union",
             "calibrated BMM/support route selection",
             "dynamic sequential block subgoals",
-            "task-routed support-graph subgoals",
+            "same 1M TRL/RPG actor; BMM subgoal selection; support control 59/75",
             "exact discrete planner plus learned local controller",
+            "There is not one universal low-level actor across all headline rows",
+            "policy-interface demonstrations rather than same-extraction TRL actor comparisons",
+            "### 6.5 Fixed-controller hierarchical planning",
         ]
     require_text(REPO_ROOT / "BMM_TRL_CONFERENCE_DRAFT.md", hard_rows)
     require_text(
@@ -347,23 +384,27 @@ def validate_surface_text() -> None:
             "Hard paper-listed rows from `exp/bmm_advanced_policy_table.md`",
             "The current task-coverage audit is `exp/bmm_paper_task_coverage_audit.md`",
             "all 10 promoted rows beat or match the paper on overall success",
-            "6 of 9 rows with paper per-task references beat or match every individual task entry",
-            "AntSoccer beats the paper overall only as a task-routed support-only policy suite",
+            "8 of 9 rows with paper per-task references beat or match every individual task entry",
+            "AntSoccer now beats the paper overall as a fixed-actor BMM graph-subgoal row",
             "The AntSoccer artifact audit is `exp/antsoccer_arena_artifact_audit.md`",
             "BMM_TRL_REPRO_COMMANDS.md",
             "conda run --no-capture-output -n bmm-trl python scripts/validate_bmm_paper_claims.py",
-            "the best clean single-protocol AntSoccer result is 69.3% versus the paper's 73.0% overall row",
+            "BMM graph subgoals using that same fixed actor reach 68/75 (90.7%)",
             "puzzle-4x4-play-oraclerep | 34.0% | 97.3% (73/75)",
             "humanoidmaze-large-navigate-oraclerep | 8.0% | 89.3% (67/75)",
             "cube-single-play-oraclerep | 95.0% | 98.7% (74/75)",
             "cube-double-play-oraclerep | 30.0% | 73.3% (55/75)",
-            "antsoccer-arena-navigate-oraclerep | 73.0% | 77.3% (58/75)",
+            "antsoccer-arena-navigate-oraclerep | 73.0% | 90.7% (68/75)",
             "calibrated BMM/support route selection",
             "exact Lights Out planner",
             "dynamic sequential block subgoals",
-            "heldout offset smokes 13/15, 12/15, 12/15, and 12/15",
+            "heldout windows 15/18/21/24/27/30 of",
+            "full corrected 75-rollout protocol reaches 62/75 (82.7%)",
+            "14/15 for their oracle union",
             "HumanoidMaze-giant should be reported as a calibrated hard-row success",
-            "matched support-path-only 63/75",
+            "task-2-only controller RNG reset reaches 65/75",
+            "There is not a single same low-level actor across all headline rows",
+            "same-extraction TRL actor comparisons",
         ],
     )
     require_text(
@@ -374,19 +415,45 @@ def validate_surface_text() -> None:
             "puzzle-4x6-play-oraclerep & 51.0% & 92.0% (69/75)",
             "humanoidmaze-medium-navigate-oraclerep & 57.0% & 94.7% (71/75)",
             "humanoidmaze-large-navigate-oraclerep & 8.0% & 89.3% (67/75)",
-            "humanoidmaze-giant-navigate-oraclerep & 79.0% & 80.0% (60/75)",
+            "humanoidmaze-giant-navigate-oraclerep & 79.0% & 82.7% (62/75)",
             "matched support-path-only reaches 63/75",
             "cube-single-play-oraclerep & 95.0% & 98.7% (74/75)",
             "cube-double-play-oraclerep & 30.0% & 73.3% (55/75)",
-            "antsoccer-arena-navigate-oraclerep & 73.0% & 77.3% (58/75)",
+            "antsoccer-arena-navigate-oraclerep & 73.0% & 90.7% (68/75)",
             "BMM_TRL_REPRO_COMMANDS.md",
             "conda run --no-capture-output -n bmm-trl python",
             "scripts/validate_bmm_paper_claims.py",
-            "heldout offset smokes reach 13/15, 12/15, 12/15, and 12/15",
+            "heldout offset smokes reach 13/15, 12/15, 12/15, 12/15, and 12/15, before an offset-30 stress test drops to 8/15",
+            "14/15 with their oracle union",
             "calibrated BMM/support route selection",
             "dynamic sequential block subgoals",
-            "task-routed support-graph subgoals",
+            "same 1M TRL/RPG actor; BMM subgoal selection; support control 59/75",
+            "bmm_tabular_error_scaling.png",
+            "The low-level actor is not shared across all rows",
+            "policy-interface demonstrations rather than same-extraction TRL actor comparisons",
             "not a full multi-seed OGBench benchmark",
+        ],
+    )
+    require_text(
+        REPO_ROOT / "BMM_TRL_ARXIV_REPORT.md",
+        [
+            "validation states to train-support bins and, over seeds 0/1/2",
+            "gap from 0.0128 to 0.1896 with max-min Q/V",
+            "promoted calibrated BMM/support route selector with `subgoal_commit_steps=10` reaches 62/75 (82.7%)",
+            "heldout windows 15/18/21/24/27/30 of 13/15, 13/15, 11/15, 14/15, 13/15, and 14/15",
+            "BMM graph subgoals with that same fixed 1M TRL/RPG actor reach 68/75 (90.7%)",
+            "clean fixed-actor subgoal-selection comparison",
+            "older task-routed local-GCFBC suite remains secondary context",
+        ],
+    )
+    forbid_text(
+        REPO_ROOT / "BMM_TRL_ARXIV_REPORT.md",
+        [
+            "validation states to train-support bins and still raises the seed-0 H128 gap",
+            "calibrated BMM/support route selector reaches 60/75 (80.0%) in the corrected deterministic 75-rollout evaluation",
+            "AntSoccer beats the paper overall only with this task-routing caveat",
+            "best clean single-protocol full result is now 52/75 (69.3%)",
+            "clean single-protocol improvement to 52/75 (69.3%)",
         ],
     )
 

@@ -59,7 +59,12 @@ def collect_refs(tex: str) -> set[str]:
     return refs
 
 
+def collect_graphics(tex: str) -> list[str]:
+    return re.findall(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}", tex)
+
+
 def validate_surface(tex: str) -> None:
+    normalized_tex = " ".join(tex.split())
     forbidden = [
         "TODO",
         "TBD",
@@ -76,20 +81,29 @@ def validate_surface(tex: str) -> None:
         "Budgeted Max-Min Transitive RL",
         "non-expansive",
         "Budget-holdout",
+        "bmm_tabular_error_scaling.png",
         "Product controls",
+        "Algorithmic recipe",
+        "sample witnesses",
+        "max-min lower bound",
+        "Related Work and Positioning",
+        "Dynamic programming",
+        "end-to-end BMM actor extraction remains a limitation",
         "Scene-Play support-graph transfer",
         "Fixed-controller hierarchical planning",
+        "Claim scope",
+        "direct actor extraction and action ranking remain weak",
         "Reproducibility",
         "\\path{BMM_TRL_REPRO_COMMANDS.md}",
-        "52/75 (69.3\\%)",
-        "58/75",
-        "55/75 (73.3\\%)",
+        "53/75 (70.7\\%)",
+        "63/75 (84.0\\%)",
         "66/75 (88.0\\%)",
         "63/75 (84.0\\%)",
-        "not as a single uniform policy-extraction or pure-BMM",
+        "fixed low-level policy plus BMM high-level subgoal selection",
+        "low-level actor is not shared across all rows",
     ]
     for needle in required:
-        if needle not in tex:
+        if needle not in tex and needle not in normalized_tex:
             fail(f"Missing required manuscript phrase: {needle}")
 
 
@@ -115,9 +129,21 @@ def validate() -> None:
         fail(f"Missing referenced labels: {missing_refs}")
 
     table_count = len(re.findall(r"\\begin\{table\}", tex))
+    figure_count = len(re.findall(r"\\begin\{figure\}", tex))
     caption_count = len(re.findall(r"\\caption\{", tex))
-    if table_count != caption_count:
-        fail(f"Expected every table to have one caption, got {table_count} tables and {caption_count} captions")
+    if table_count + figure_count != caption_count:
+        fail(
+            "Expected every table/figure to have one caption, got "
+            f"{table_count} tables, {figure_count} figures, and {caption_count} captions"
+        )
+
+    missing_graphics = []
+    for graphic in collect_graphics(tex):
+        graphic_path = (TEX_PATH.parent / graphic).resolve()
+        if not graphic_path.exists():
+            missing_graphics.append(graphic)
+    if missing_graphics:
+        fail(f"Missing included graphics: {missing_graphics}")
 
     validate_surface(tex)
 

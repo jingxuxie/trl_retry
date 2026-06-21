@@ -17,7 +17,7 @@ NON_PROMOTED_ROWS = [
         "env": "antsoccer-arena-navigate-oraclerep-v0",
         "paper_overall": 73.0,
         "artifact": "exp/antsoccer_arena_graph_gcfbc100k_support_switch64_ep15_seed10_detreset.json",
-        "reason": "Best clean single-protocol confirmation remains below the paper row; the promoted row is task-routed support-only.",
+        "reason": "Older local-GCFBC single-protocol control remains below the paper row; the promoted row now uses BMM graph subgoals with a fixed 1M TRL/RPG controller.",
     },
 ]
 

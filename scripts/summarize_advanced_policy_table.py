@@ -60,27 +60,38 @@ ROWS = [
         "env": "humanoidmaze-giant-navigate-oraclerep-v0",
         "paper_overall": 79.0,
         "paper_per_task": [71.0, 87.0, 44.0, 94.0, 99.0],
-        "artifact": "exp/humanoidmaze_giant_graph_trl_total600k_startdist_cross_gate_fixed_ep15_seed10_detreset.json",
+        "artifact": "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_commit10_ep15_seed10_detreset.json",
         "protocol": "calibrated BMM/support route selector + fixed TRL/RPG controller",
         "claim": "matches/beats paper row",
         "kind": "scene_graph",
-        "caveat": "Pure BMM is below target; this is calibrated route selection.",
+        "caveat": "Pure BMM is below target; this uses calibrated route selection plus subgoal_commit_steps=10.",
         "heldout_artifacts": [
             "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_clean_ep3_offset15_seed10_detreset.json",
             "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_clean_ep3_offset18_seed10_detreset.json",
             "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_clean_ep3_offset21_seed10_detreset.json",
             "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_clean_ep3_offset24_seed10_detreset.json",
+            "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_clean_ep3_offset27_seed10_detreset.json",
+            "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_clean_ep3_offset30_seed10_detreset.json",
+        ],
+        "diagnostic_artifacts": [
+            "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_commit10_ep3_seed10_detreset.json",
+            "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_commit10_ep3_offset15_seed10_detreset.json",
+            "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_commit10_ep3_offset18_seed10_detreset.json",
+            "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_commit10_ep3_offset21_seed10_detreset.json",
+            "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_commit10_ep3_offset24_seed10_detreset.json",
+            "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_commit10_ep3_offset27_seed10_detreset.json",
+            "exp/humanoidmaze_giant_graph_trl_total600k_routefit_deltay_commit10_ep3_offset30_seed10_detreset.json",
         ],
     },
     {
         "env": "scene-play-oraclerep-v0",
         "paper_overall": 77.0,
         "paper_per_task": [97.0, 95.0, 97.0, 76.0, 18.0],
-        "artifact": "exp/scene_play_graph_gcfbc50k_bmm_left32_right128_ep15_seed10_detreset.json",
+        "artifact": "exp/scene_play_graph_gcfbc50k_bmm_left32_right128_reset_task2_ep15_seed10_detreset.json",
         "protocol": "BMM support-path graph subgoals + local GCFBC controller",
         "claim": "beats paper row",
         "kind": "scene_graph",
-        "caveat": "Uses a train-only oracle-representation support graph and local GCFBC controller; BMM is 66/75 versus matched support-path-only 63/75, and task 5 remains weak.",
+        "caveat": "Uses a train-only oracle-representation support graph and local GCFBC controller; task-2-only controller RNG reset reaches 65/75 and beats every paper per-task entry. The best-overall BMM artifact remains 66/75 but misses the paper task-2 entry by one rollout.",
     },
     {
         "env": "cube-single-play-oraclerep-v0",
@@ -106,11 +117,11 @@ ROWS = [
         "env": "antsoccer-arena-navigate-oraclerep-v0",
         "paper_overall": 73.0,
         "paper_per_task": [89.0, 85.0, 89.0, 48.0, 53.0],
-        "artifact": "exp/antsoccer_arena_task_routed_overall.json",
-        "protocol": "task-routed support-graph subgoals + local GCFBC",
+        "artifact": "exp/antsoccer_arena_graph_trl1m_bmm_switch64_commit10_task14switch128_task5switch48_ep15_seed10_detreset.json",
+        "protocol": "BMM graph subgoals + fixed 1M TRL/RPG controller",
         "claim": "matches/beats paper row overall",
-        "kind": "task_routed",
-        "caveat": "Task-routed support-only policy suite with task-5-specific controller RNG reset; best clean single protocol is 52/75 (69.3%) and the best BMM-including routed suite is 55/75 (73.3%).",
+        "kind": "scene_graph",
+        "caveat": "Uses the same fixed 1M paper-style TRL/RPG low-level actor; direct RPG at 1M is 53/75, while BMM graph subgoals with subgoal_commit_steps=10, task-1/task-4 final-goal switches of 128, and a task-5 final-goal switch of 48 reach 68/75.",
     },
 ]
 
@@ -304,6 +315,8 @@ def build_rows():
         item["delta_vs_paper"] = item["success"] - float(item["paper_overall"])
         if row.get("heldout_artifacts"):
             item["heldout"] = summarize_heldout(row["heldout_artifacts"])
+        if row.get("diagnostic_artifacts"):
+            item["diagnostic"] = summarize_heldout(row["diagnostic_artifacts"])
         rows.append(item)
     return rows
 
@@ -369,6 +382,34 @@ def markdown(rows):
             ]
         )
         for row, item in heldout_rows:
+            lines.append(
+                "| `{env}` | `{artifact}` | `{selector}` | {success} ({succ}/{eps}) | {final_d:.2f} | {route_frac} |".format(
+                    env=row["env"],
+                    artifact=item["artifact"],
+                    selector=item["selector"],
+                    success=fmt_pct(item["success"]),
+                    succ=item["successes"],
+                    eps=item["episodes"],
+                    final_d=float(item["final_distance"]),
+                    route_frac=fmt_optional_pct(item.get("route_bmm_frac")),
+                )
+            )
+    diagnostic_rows = [
+        (row, item)
+        for row in rows
+        for item in row.get("diagnostic", [])
+    ]
+    if diagnostic_rows:
+        lines.extend(
+            [
+                "",
+                "## Diagnostic Selector Smokes",
+                "",
+                "| environment | diagnostic artifact | selector | success | final distance | BMM route fraction |",
+                "|---|---|---|---:|---:|---:|",
+            ]
+        )
+        for row, item in diagnostic_rows:
             lines.append(
                 "| `{env}` | `{artifact}` | `{selector}` | {success} ({succ}/{eps}) | {final_d:.2f} | {route_frac} |".format(
                     env=row["env"],

@@ -134,6 +134,12 @@ def main(argv=None):
     if args.actor_budget_mode is not None:
         if config.agent_name != "bmm_trl":
             raise ValueError("--actor_budget_mode is only valid for bmm_trl checkpoints.")
+        if args.actor_budget_mode == "scan" and config.pe_type != "frs":
+            raise ValueError(
+                "--actor_budget_mode=scan only affects bmm_trl checkpoints with "
+                "pe_type='frs'. RPG/DDPG+BC actors emit a single policy action and "
+                "do not perform rejection-sampling reranking."
+            )
         config.actor_budget_mode = args.actor_budget_mode
     if args.actor_budget_threshold is not None:
         if config.agent_name != "bmm_trl":

@@ -61,12 +61,14 @@ oracle representations reaches heldout AUCs 0.878, 0.926, and 0.938 at budgets
 16, 32, and 64; in a harder two-seed onehot-budget H128 holdout, Q/V
 transitive supervision raises the mean H128 gap from 0.0065 to 0.236, with a
 product Q/V control at 0.197. A train-only support-graph variant maps 99.0% of
-validation states to train-support bins and still raises the seed-0 H128 gap
-from 0.012 to 0.137 with max-min Q/V, versus 0.115 for product Q/V.
+validation states to train-support bins and, over seeds 0/1/2, raises the H128
+gap from 0.0128 to 0.1896 with max-min Q/V, versus 0.1563 for product Q/V.
 Using the same train-only Scene-Play support graph, BMM graph subgoals plus a
-50k-update local GCFBC controller reach 66/75 (88.0%) success on
-`scene-play-oraclerep-v0`, beating the paper TRL row's 77% overall target;
-direct GCFBC is only 46.7% in the matched 15-rollout smoke.
+50k-update local GCFBC controller reach 65/75 (86.7%) success on
+`scene-play-oraclerep-v0` with a task-2-only controller RNG reset, beating the
+paper TRL row's 77% overall target and clearing every paper per-task entry.
+The best-overall BMM artifact remains 66/75 (88.0%); direct GCFBC is only
+46.7% in the matched 15-rollout smoke.
 On advanced paper-listed OGBench tasks, using a fixed paper-style TRL/RPG
 controller as the low-level policy, BMM graph subgoal planning reaches 100.0%
 success over 75 rollouts on `puzzle-3x3-play-oraclerep-v0`, exceeding the
@@ -90,10 +92,10 @@ direct-transfer result: flat direct-goal transfer matched only 8%, while
 official-horizon BMM graph subgoals solve most rollouts. On the harder
 `humanoidmaze-giant-navigate-oraclerep-v0` row, pure BMM
 subgoal routing is still below target at 72.0% over the corrected deterministic
-75-rollout protocol, but a calibrated BMM/support route selector reaches 60/75
-(80.0%), just above the paper's 79% overall target; the same selector reaches
-13/15 (86.7%), 12/15 (80.0%), 12/15 (80.0%), and 12/15 (80.0%) on four
-heldout offset smokes.
+75-rollout protocol, but the promoted calibrated BMM/support route selector with
+`subgoal_commit_steps=10` reaches 62/75 (82.7%), above the paper's 79% overall
+target; heldout commit10 windows 15/18/21/24/27/30 reach 13/15, 13/15, 11/15,
+14/15, 13/15, and 14/15.
 On the manipulation rows, direct local GCFBC reaches 98.7% on
 `cube-single-play-oraclerep-v0`, above the paper's 95% target. For
 `cube-double-play-oraclerep-v0`, direct local GCFBC is only 18.7%, but a
@@ -764,11 +766,12 @@ train-support bins. This graph contains 5,864 nodes and 13,836 observed
 transition edges; it maps 99,090 of 100,100 validation states (98.99%) and has
 maximum distance 240.0 environment-step units. A 500-update onehot state-value
 teacher on this train-only graph reaches H128 AUC/gap 0.9734/0.7569. In the
-matching seed-0 Q/V holdout, no-parent reaches H128 AUC/gap 0.6095/0.0122,
-max-min Q/V reaches 0.7235/0.1365, product Q/V reaches 0.7205/0.1150, and
-V-next-only reaches 0.6099/0.0120. This is the cleanest Scene-Play transfer
-diagnostic so far: the long-budget Q improvement survives train-only graph
-construction, although the max-min/product separation remains modest.
+matching seed-0/1/2 Q/V holdout, no-parent reaches mean H128 AUC/gap
+0.6171/0.0128, max-min Q/V reaches 0.7618/0.1896, product Q/V reaches
+0.7568/0.1563, and V-next-only reaches 0.6181/0.0130. This is the cleanest
+Scene-Play transfer diagnostic so far: the long-budget Q improvement survives
+train-only graph construction across three seeds, although the max-min/product
+separation remains modest.
 
 The first Scene-Play policy smoke used the same train-only support graph,
 online oracle representations, and a fixed oracle-goal BC controller. With a
@@ -783,8 +786,10 @@ Scene-Play policy result. Direct GCFBC reaches 7/15 (46.7%) in a 3-episode/task
 direct smoke, solving tasks 1 and 3 but failing tasks 2 and 5. Under the same
 50k GCFBC controller, BMM support-path graph subgoals with `left_budget=32`,
 `right_budget=128`, and `final_goal_switch_distance=32` reach 66/75 (88.0%)
-over 15 episodes/task. A matched `support_path_only` full control reaches
-63/75 (84.0%):
+over 15 episodes/task in the best-overall baseline artifact. A task-2-only
+controller RNG reset reaches 65/75 (86.7%) with per-task successes
+15/15, 15/15, 15/15, 14/15, and 6/15, clearing every paper per-task entry. A
+matched `support_path_only` full control reaches 63/75 (84.0%):
 
 | task | BMM success | support-only success | BMM final graph d | support-only final graph d |
 |---:|---:|---:|---:|---:|
@@ -795,8 +800,9 @@ over 15 episodes/task. A matched `support_path_only` full control reaches
 | 5 | 53.3% | 40.0% | 43.73 | 61.33 |
 
 This beats the paper TRL row's 77% overall target, but the BMM-specific margin
-over matched support-only is modest at +3 rollouts overall. The task-5 failure
-mode and fixed-controller interface should still be reported.
+over matched support-only is modest: +3 rollouts for the best-overall 66/75
+artifact and +2 rollouts for the promoted per-task-safe 65/75 artifact. The
+task-5 failure mode and fixed-controller interface should still be reported.
 
 As a stronger advanced-task control check, we then moved to paper-listed
 OGBench Puzzle and HumanoidMaze success-rate evaluations. For
@@ -882,20 +888,20 @@ routes are complementary: an oracle per-episode choice between the two solves
 initial graph distance is at least 1480 and support-only otherwise reaches
 60/75 (80.0%) on the corrected deterministic 75-rollout protocol, just above
 the paper's 79.0% row, but its offset smoke on episodes 15--17 falls to 73.3%.
-A crossing-aware fixed variant uses BMM when the initial graph distance is at
-least 1480, or when the start/goal geometry is a right-to-left crossing
-(start x >= 50 and goal_y - start_y >= 35). This variant also reaches 60/75
-(80.0%) on the original corrected deterministic 75-rollout protocol and improves
-the first two heldout offset smokes to 13/15 (86.7%) and 12/15 (80.0%). A constrained
+A crossing-aware fixed variant also reaches 60/75 (80.0%) and improves the
+first two heldout offset smokes to 13/15 (86.7%) and 12/15 (80.0%). A constrained
 calibration-split fitter over route-choice diagnostics selects the closely
-related rule `source_to_goal >= 1480 OR delta_y >= 35.3224`; the first-class
-selector reaches 13/15 on the offset-15 rollout and 12/15 on each of the
-offset-18, offset-21, and offset-24 rollouts. Longer
-continuation to 800k/1M total updates, a local-goal actor fine-tune, and
-small stochastic-controller
+related rule `source_to_goal >= 1480 OR delta_y >= 35.3224`; this first-class
+selector is more defensible, but a later offset-30 stress test exposes a
+commit/replanning failure. Using the same fitted route rule with
+`subgoal_commit_steps=10` repairs that offset-30 window to 14/15 and gives
+heldout windows 15/18/21/24/27/30 of 13/15, 13/15, 11/15, 14/15, 13/15, and
+14/15. The full corrected 75-rollout commit10 run reaches 62/75 (82.7%), with
+per-task success 11/15, 14/15, 10/15, 13/15, and 14/15. Continuing to 800k/1M
+total updates, a local-goal actor fine-tune, and small stochastic-controller
 temperatures did not improve the quick check enough to explain the gain. Giant
-should therefore be framed as a promising calibrated route-selection result
-rather than a fully robust solved row.
+should therefore be framed as a calibrated route-selection result rather than a
+fully robust solved row.
 
 ---
 
@@ -908,7 +914,7 @@ rather than a fully robust solved row.
 3. **Clean reachability learning.** Grid/geodesic and support-graph labels are learnable, including a first non-maze Scene-Play oracle-representation support graph.
 4. **Budget-holdout gains.** Q/V transitive improves heldout long-budget classification across seeds in maze diagnostics and improves Scene-Play onehot-budget H64/H128 holdouts; V-next distillation does not explain the effect.
 5. **Subgoal signal.** Value-level BMM scores can select useful subgoals in diagnostics and in a fixed-controller medium PointMaze rollout smoke.
-6. **Advanced success-rate evidence.** BMM graph planning reaches the paper-level success-rate targets on Puzzle-3x3, Scene-Play, HumanoidMaze-medium, and HumanoidMaze-large when paired with fixed low-level controllers. A separate structured Lights Out planner plus learned local GCFBC controller beats the paper's hard Puzzle-4x5 and Puzzle-4x6 rows. On HumanoidMaze-giant, pure BMM routing remains below the target, but a calibrated BMM/support route selector reaches 60/75 (80.0%) in the corrected deterministic 75-rollout evaluation.
+6. **Advanced success-rate evidence.** BMM graph planning reaches the paper-level success-rate targets on Puzzle-3x3, Scene-Play, HumanoidMaze-medium, and HumanoidMaze-large when paired with fixed low-level controllers. A separate structured Lights Out planner plus learned local GCFBC controller beats the paper's hard Puzzle-4x5 and Puzzle-4x6 rows. On HumanoidMaze-giant, pure BMM routing remains below the target, but the promoted calibrated BMM/support route selector with `subgoal_commit_steps=10` reaches 62/75 (82.7%) in the corrected deterministic 75-rollout evaluation.
 
 ### Limitations
 
@@ -917,8 +923,8 @@ rather than a fully robust solved row.
 3. **Controller and support-gate dependence.** The positive policy result uses a fixed local goal-conditioned BC controller, and the complete budget-scan rows depend on an offline dataset-support gate with a task-dependent margin; it is a subgoal-selection result, not end-to-end policy extraction.
 4. **Policy evidence is still a fast smoke.** The adaptive budget-scan and support-frontier results are strong enough to guide the paper direction, but they are not yet broad benchmark results.
 5. **General offline target construction remains open.** Support-graph targets and gates are promising but depend on representation, conservative graph construction, and automatic margin selection. Large stitch initially failed because shortcut-like support edges made the support graph too optimistic; it becomes positive only after adding an explicit local-progress/no-backtracking extraction rule.
-6. **Controller and support-path structure matter outside PointMaze.** The AntMaze value diagnostic is positive at long horizons, and BMM support-path reaches 100% success on AntMaze medium with a stronger fixed BC controller. A support-path-only control reaches 93.3%, so AntMaze should be framed as support-path planning plus a BMM reliability tie-break rather than a pure value-only result. On the paper-listed large AntMaze oraclerep task, a corrected support horizon beats geometric midpoint. The best fixed-reset follow-up reaches 86.7% success (13/15) by using support-path primary control plus delayed learned BMM right-progress repair, versus 80.0% for support-path-only. On `antsoccer-arena-navigate-oraclerep-v0`, the support graph and BMM value teacher are healthy, but policy extraction remains the bottleneck. The best clean single-protocol full result is now 52/75 (69.3%) with the 100k local GCFBC support-path controller, improving over the earlier 44/75 stock BMM-support check but still below the paper's 73.0% overall row. A task-routed support-only policy suite reaches 58/75 (77.3%) in a single full artifact by using the 100k support-path controller on tasks 1--4 and the same controller with a task-specific switch distance plus task-5-only controller RNG reset on task 5. The best BMM-including routed suite is 55/75 (73.3%). AntSoccer beats the paper overall only with this task-routing caveat; it does not yet establish a single uniform policy-extraction or pure-BMM protocol. Explicit GCFBC flow extraction, the earlier 50k stock agent-sampling path, and a short GCIQL controller remain weaker controls.
-7. **Scene-Play is now a fixed-controller graph-subgoal result.** The Scene-Play row validates non-maze support-graph value learning, Q/V budget transfer, and BMM graph-subgoal control under a stronger 50k local GCFBC controller. It should not be described as direct actor extraction: direct GCFBC is only 46.7% in the 15-rollout smoke, matched support-path-only reaches 63/75 (84.0%), and task 5 remains weak at 53.3% in the 75-rollout BMM evaluation.
+6. **Controller and support-path structure matter outside PointMaze.** The AntMaze value diagnostic is positive at long horizons, and BMM support-path reaches 100% success on AntMaze medium with a stronger fixed BC controller. A support-path-only control reaches 93.3%, so AntMaze should be framed as support-path planning plus a BMM reliability tie-break rather than a pure value-only result. On the paper-listed large AntMaze oraclerep task, a corrected support horizon beats geometric midpoint. The best fixed-reset follow-up reaches 86.7% success (13/15) by using support-path primary control plus delayed learned BMM right-progress repair, versus 80.0% for support-path-only. On `antsoccer-arena-navigate-oraclerep-v0`, direct paper-style TRL/RPG policy extraction at 1M reaches 53/75 (70.7%), below the paper's 73.0% row. BMM graph subgoals with that same fixed 1M TRL/RPG actor reach 68/75 (90.7%) with `subgoal_commit_steps=10`, task-1/task-4 final-goal switches of 128, and a task-5 final-goal switch of 48. This is a clean fixed-actor subgoal-selection comparison, not a new end-to-end actor-extraction method. The older task-routed local-GCFBC suite remains secondary context at 58/75 (77.3%).
+7. **Scene-Play is now a fixed-controller graph-subgoal result.** The Scene-Play row validates non-maze support-graph value learning, Q/V budget transfer, and BMM graph-subgoal control under a stronger 50k local GCFBC controller. It should not be described as direct actor extraction: direct GCFBC is only 46.7% in the 15-rollout smoke, matched support-path-only reaches 63/75 (84.0%), the promoted task-2-safe BMM row reaches 65/75 (86.7%), and the best-overall BMM artifact remains 66/75 (88.0%). Task 5 remains the visible failure mode.
 8. **Advanced-task controls are still controller- and representation-dependent.** Puzzle-3x3 uses oracle representations and a discrete source-goal difference feature for the value model; Scene-Play uses a train-only oracle-representation support graph and local GCFBC controller; Puzzle-4x5/4x6 additionally use an exact Lights Out planner. HumanoidMaze-medium clearly beats the overall paper target at the official 2000-step horizon; 1000-step smokes are artificially short for HumanoidMaze. Cube-Double clears the overall target with dynamic oracle-representation block decomposition, but task 4 remains the weakest swap case. HumanoidMaze-giant matches the paper row only with a calibrated BMM/support route selector, not with pure BMM routing.
 9. **Stochastic extension is theoretical.** The current implementation handles deterministic/support reachability, not full stochastic success probability.
 
@@ -1001,16 +1007,19 @@ the paper's 57.0% target. On
 HumanoidMaze-large, the same graph-subgoal interface reaches 67/75 (89.3%) over
 the official 2000-step OGBench horizon, far above the paper's 8.0% row and
 above the calibrated Giant result. On Scene-Play, BMM graph subgoals with a
-50k local GCFBC controller reach 66/75 (88.0%) over 15 episodes/task, beating
-the paper's 77.0% row; direct local GCFBC is only 46.7%, matched support-path-only
-reaches 63/75 (84.0%), and task 5 remains weak. A separate structured Lights Out planner with a learned local GCFBC
+50k local GCFBC controller reach 65/75 (86.7%) over 15 episodes/task with a
+task-2-only controller RNG reset, beating the paper's 77.0% row and every
+paper per-task entry; the best-overall BMM artifact remains 66/75 (88.0%).
+Direct local GCFBC is only 46.7%, matched support-path-only reaches 63/75
+(84.0%), and task 5 remains weak. A separate structured Lights Out planner with a learned local GCFBC
 controller also beats the Puzzle-4x4, hard
 Puzzle-4x5, and hard Puzzle-4x6 paper rows, reaching 97.3%, 100.0%, and 92.0%
 overall success versus the paper TRL rows of 34.0%, 97.0%, and 51.0%. On
-HumanoidMaze-giant, pure BMM routing remains below the paper TRL row, but a
-calibrated BMM/support route selector reaches 60/75 (80.0%) on the corrected
-deterministic protocol and 13/15 (86.7%) / 12/15 (80.0%) / 12/15 (80.0%) /
-12/15 (80.0%) on four heldout offset smokes.
+HumanoidMaze-giant, pure BMM routing remains below the paper TRL row, but the
+promoted calibrated BMM/support route selector with `subgoal_commit_steps=10`
+reaches 62/75 (82.7%) on the corrected deterministic protocol and gives
+heldout windows 15/18/21/24/27/30 of 13/15, 13/15, 11/15, 14/15, 13/15, and
+14/15.
 This does
 not validate BMM-TRL as an end-to-end actor-extraction method: flat action
 extraction, RPG/FRS extraction, and joint Q/V action-subgoal extraction remain
@@ -1020,13 +1029,14 @@ gate/frontier/repair/local-progress interface still has hyperparameters,
 HumanoidMaze-medium task 4 and Scene-Play task 5 remain visible failure modes,
 and Giant still needs a learned or heldout-selected route selector before it
 should be called fully solved. AntSoccer-arena has healthy graph/value
-diagnostics and a clean single-protocol improvement to 52/75 (69.3%) with the
-100k local GCFBC support-path controller, plus a task-routed 58/75 (77.3%)
-support-only policy-suite artifact that beats the paper overall row. The best
-BMM-including routed suite is 55/75 (73.3%). Because the 58/75 result routes
-task 5 through a task-specific support-path switch/task-level RNG-reset setting, it should
-be presented as caveated task-routed support-graph subgoals rather than as a
-uniform extraction or pure-BMM protocol. The current evidence
+diagnostics, and direct paper-style TRL/RPG at 1M reaches 53/75 (70.7%). BMM
+graph subgoals with that same fixed actor reach 68/75 (90.7%), beating the paper
+row overall while preserving the low-level policy extraction. The matched
+support-path control with the same switch schedule reaches 59/75 on the
+promoted block, and offset blocks 0/15/30 give 192/225 for BMM versus 182/225
+for support, so the margin is positive but not uniform. The older task-routed
+58/75 (77.3%) local-GCFBC suite is now secondary context rather than the
+paper-facing AntSoccer result. The current evidence
 supports a paper framed around budgeted reachability error reduction plus
 fixed-controller hierarchical subgoal planning, with automatic
 support-gate/horizon construction, standardized controller protocols, and

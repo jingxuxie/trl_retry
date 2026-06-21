@@ -1660,23 +1660,23 @@ A 500-update onehot state-value teacher trained cleanly on the train-only graph:
 | 128 | 0.9734 | 0.7569 | 0.9722 | 0.7520 |
 
 The train-only Q/V holdout uses direct Q labels only at H=16 and H=32, with
-H=64 and H=128 held out. Seed 0 gives:
+H=64 and H=128 held out. Seeds 0, 1, and 2 now give:
 
 | Variant | H64 AUC | H64 gap | H128 AUC | H128 gap | H128 ensemble-min AUC | H128 ensemble-min gap |
 |---|---:|---:|---:|---:|---:|---:|
-| A no parent/no trans | 0.8732 | 0.1312 | 0.6095 | 0.0122 | 0.6063 | 0.0085 |
-| B max-min Q/V | 0.8869 | 0.3425 | 0.7235 | 0.1365 | 0.7256 | 0.1133 |
-| P product Q/V | 0.8882 | 0.3198 | 0.7205 | 0.1150 | 0.7177 | 0.0913 |
-| F V-next distill | 0.8734 | 0.1306 | 0.6099 | 0.0120 | 0.6083 | 0.0087 |
+| A no parent/no trans | 0.8687 | 0.1253 | 0.6171 | 0.0128 | 0.6357 | 0.0093 |
+| B max-min Q/V | 0.8781 | 0.3959 | 0.7618 | 0.1896 | 0.7594 | 0.1650 |
+| P product Q/V | 0.8793 | 0.3794 | 0.7568 | 0.1563 | 0.7530 | 0.1317 |
+| F V-next distill | 0.8688 | 0.1265 | 0.6181 | 0.0130 | 0.6360 | 0.0096 |
 
 Interpretation: this addresses the main offline-clean concern for the
 Scene-Play diagnostic. Even when the support graph is built from train only,
 transitive Q/V supervision transfers to the heldout H128 budget, while
 V-next-only distillation does not. Max-min BMM remains directionally better than
-product on H128 confidence, but the gap is modest and single-seed here. The
-stronger claim is transfer through the budgeted reachability/Q-V interface; the
-max-min-over-product claim should rely on the train+validation two-seed result
-as suggestive evidence, not a standalone conclusion.
+product on H128 confidence, but the gap is modest. The stronger claim is
+transfer through the budgeted reachability/Q-V interface; the max-min-over-product
+claim should rely on the broader aggregate as suggestive evidence, not a
+standalone conclusion.
 
 Artifacts:
 
@@ -1694,6 +1694,10 @@ exp/bmm_scene_play_oraclerep_trainonly_graph_factor8_value_onehot_16_32_64_128_5
 exp/bmm_scene_play_oraclerep_trainonly_graph_factor8_value_onehot_16_32_64_128_500/params_500.pkl
 exp/bmm_scene_play_trainonly_graph_qv_holdout_h64_h128_onehot_seed0_smoke/summary.csv
 exp/bmm_scene_play_trainonly_graph_qv_holdout_h64_h128_onehot_seed0_smoke/summary.json
+exp/bmm_scene_play_trainonly_graph_qv_holdout_h64_h128_onehot_seed1_smoke/summary.csv
+exp/bmm_scene_play_trainonly_graph_qv_holdout_h64_h128_onehot_seed1_smoke/summary.json
+exp/bmm_scene_play_trainonly_graph_qv_holdout_h64_h128_onehot_seed2_smoke/summary.csv
+exp/bmm_scene_play_trainonly_graph_qv_holdout_h64_h128_onehot_seed2_smoke/summary.json
 ```
 
 ## Scene-play graph-subgoal BC policy smoke

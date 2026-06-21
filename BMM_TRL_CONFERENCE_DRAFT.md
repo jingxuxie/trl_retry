@@ -23,8 +23,9 @@ targets also transfer, but BMM gives a small consistent advantage in matched
 product controls. On Scene-Play oracle representations, a train-only
 support-graph diagnostic shows that the same long-budget Q improvement survives
 outside maze coordinates. With a stronger local GCFBC controller, BMM
-graph-subgoal planning also reaches 88.0% success on the paper-listed
-Scene-Play row. Finally, when paired with a fixed local goal-conditioned
+graph-subgoal planning also reaches 86.7% success on the paper-listed
+Scene-Play row while clearing every paper per-task entry. Finally, when paired
+with a fixed local goal-conditioned
 controller, BMM reachability values improve hierarchical subgoal planning on
 long-horizon PointMaze, AntMaze, Scene-Play, Puzzle, and HumanoidMaze tasks,
 including paper-listed hard rows that match or exceed the reported TRL success
@@ -134,7 +135,23 @@ selection rules under that same controller. This keeps the empirical question
 focused: does the learned BMM reachability value provide useful long-horizon
 subgoals?
 
-## 3. Budgeted Max-Min Transitive RL
+## 3. Related Work and Positioning
+
+Dynamic programming gives the classical view of value composition through
+Bellman backups. BMM-TRL keeps this principle but changes the value object
+being composed: finite-budget reachability predicates yield a max-min
+transitive backup rather than product composition of discounted values. Offline
+goal-conditioned RL builds on universal goal-conditioned values and hindsight
+relabeling, while modern offline methods emphasize staying close to dataset
+support; HIQL and OGBench make long-horizon offline goal-reaching benchmarks
+central. The closest prior method is TRL: we keep its witness-based
+divide-and-conquer structure, but replace the discounted product target with a
+budgeted max-min target. Thus the core claim is about value-error propagation;
+the policy results use fixed controllers or documented planners, and
+end-to-end BMM actor extraction remains a limitation rather than a claimed
+contribution.
+
+## 4. Budgeted Max-Min Transitive RL
 
 ### Reachability values
 
@@ -223,7 +240,7 @@ which is linear in horizon under equal splits and uniform residuals.
 This distinction is the core algorithmic reason to learn budgeted reachability
 rather than discounted temporal distance.
 
-## 4. Offline Targets and Training
+## 5. Offline Targets and Training
 
 ### Reachability targets
 
@@ -267,6 +284,28 @@ value after the dataset action. The product control tests whether max-min is
 empirically distinct from a TRL-style product target under the same witness
 sampler and loss implementation.
 
+### Algorithmic recipe
+
+BMM-TRL can be implemented without changing the low-level actor API:
+
+1. Choose a budget set `H_1 < ... < H_K` and construct binary reachability
+   labels for short budgets from geodesic, environment-step, or support-graph
+   distances.
+2. Train short-budget Q/V critics with supervised binary cross-entropy.
+3. For each heldout or long parent budget `H`, sample witnesses `w` and split
+   the budget into left/right branches `(h, H-h)`.
+4. Form the parent target with the max-min lower bound
+   `max_w min(Q_h(s,a,w), V_{H-h}(w,g))`.
+5. Fit the parent critic with the same reachability loss and evaluate it on
+   heldout long-budget pairs.
+6. For policy-facing evaluations, keep the local controller fixed and use the
+   learned reachability scores only to choose supported subgoals.
+
+This is why the main experiments separate value learning from policy
+extraction: the method claim is that the budgeted max-min target improves
+long-budget reachability estimates, and the control claim is that those values
+are useful for hierarchical subgoal selection under a fixed controller.
+
 ### Budget-holdout protocol
 
 The central diagnostic withholds direct labels for a long parent budget:
@@ -280,12 +319,12 @@ train the parent using transitive Q/V targets.
 This directly tests the intended long-horizon value-learning mechanism:
 whether shorter-budget reachability can bootstrap a longer-budget parent.
 
-## 5. Experiments
+## 6. Experiments
 
 All numerical results in this draft are taken from
 `exp/bmm_paper_tables_final.md`.
 
-### 5.1 Error-scaling sanity check
+### 6.1 Error-scaling sanity check
 
 With a per-level residual of `epsilon = 0.02`, the tabular recurrence check
 shows the expected separation between max-min and additive composition.
@@ -298,7 +337,7 @@ shows the expected separation between max-min and additive composition.
 This is not an empirical benchmark; it is a sanity check that the implemented
 diagnostic matches the theoretical recurrence.
 
-### 5.2 Budget-holdout value learning
+### 6.2 Budget-holdout value learning
 
 Budget-holdout is the main value-learning result. BMM improves heldout
 long-budget classification over supervised no-parent baselines, while V-next
@@ -314,7 +353,7 @@ distillation is near zero.
 The heldout parent-budget effect is the cleanest empirical support for the
 claim that BMM reduces long-horizon value error.
 
-### 5.3 Product controls
+### 6.3 Product controls
 
 Product Q/V targets also transfer. However, max-min is consistently better in
 the matched product-control diagnostics.
@@ -331,7 +370,7 @@ most of the transfer benefit, while max-min gives a modest and consistent
 advantage with a cleaner error-propagation theory. The data do not support the
 claim that product fails.
 
-### 5.4 Non-maze Scene-Play support-graph transfer
+### 6.4 Non-maze Scene-Play support-graph transfer
 
 To test whether the value-learning result depends on maze coordinates, we built
 support graphs over 7-D Scene-Play oracle representations. The train-only graph
@@ -344,26 +383,38 @@ support.
 | Scene-Play train+val graph H128 | B max-min Q/V | 0,1 | 128 | 0.8177 | 0.2355 |
 | Scene-Play train+val graph H128 | P product Q/V | 0,1 | 128 | 0.8129 | 0.1969 |
 | Scene-Play train+val graph H128 | F V-next | 0,1 | 128 | 0.6694 | 0.0067 |
-| Scene-Play train-only graph H128 | A no trans | 0 | 128 | 0.6095 | 0.0122 |
-| Scene-Play train-only graph H128 | B max-min Q/V | 0 | 128 | 0.7235 | 0.1365 |
-| Scene-Play train-only graph H128 | P product Q/V | 0 | 128 | 0.7205 | 0.1150 |
-| Scene-Play train-only graph H128 | F V-next | 0 | 128 | 0.6099 | 0.0120 |
+| Scene-Play train-only graph H128 | A no trans | 0,1,2 | 128 | 0.6171 | 0.0128 |
+| Scene-Play train-only graph H128 | B max-min Q/V | 0,1,2 | 128 | 0.7618 | 0.1896 |
+| Scene-Play train-only graph H128 | P product Q/V | 0,1,2 | 128 | 0.7568 | 0.1563 |
+| Scene-Play train-only graph H128 | F V-next | 0,1,2 | 128 | 0.6181 | 0.0130 |
 
 These value/Q diagnostics motivated a stronger Scene-Play policy follow-up.
 The first 10k oracle-goal BC graph-subgoal smoke solved only task 1/5, but a
 50k local GCFBC controller changes the policy boundary. With the same train-only
 support graph and BMM support-path subgoal selector, Scene-Play reaches 66/75
-(88.0%) over 15 episodes per task. The per-task rates are
-100.0/93.3/100.0/93.3/53.3, so task 5 remains the visible failure mode. A
-matched support-path-only 63/75 (84.0%) full control shows the Scene-Play BMM
-margin is +3 rollouts overall; BMM mainly improves tasks 3, 4, and 5 while
-support-only is slightly better on task 2.
+(88.0%) over 15 episodes per task. A task-2-only controller RNG reset reaches
+65/75 (86.7%) with per-task rates 100.0/100.0/100.0/93.3/40.0, clearing every
+paper per-task entry, so this is the promoted paper-coverage row. The baseline
+66/75 artifact remains the best-overall Scene result with per-task rates
+100.0/93.3/100.0/93.3/53.3. A matched support-path-only 63/75 (84.0%) full
+control shows the Scene-Play BMM margin is modest; task 5 remains the visible
+failure mode.
 
-### 5.5 Fixed-controller hierarchical planning
+### 6.5 Fixed-controller hierarchical planning
 
 The policy-facing experiments use a fixed local goal-conditioned BC controller.
 The comparison is therefore high-level subgoal selection, not end-to-end policy
 learning. Under this interface, BMM values can guide long-horizon behavior.
+
+The claim scope is:
+
+| claim type | evidence used here | paper use |
+|---|---|---|
+| value-error reduction | budget-holdout Q/V classification on grid-cell, env-step, and Scene-Play support graphs | main algorithmic claim |
+| BMM versus product backup | matched product controls on grid-cell and env-step holdouts | supporting evidence; product is close |
+| long-horizon control | fixed-controller subgoal selection with matched support/geometric controls where available | policy-facing evidence |
+| paper-table comparisons | 75-rollout task rows regenerated from local artifacts | success-rate evidence with protocol qualifiers |
+| policy extraction | direct actor extraction and action ranking remain weak | limitation and future work |
 
 | setting | baseline | BMM-side result |
 |---|---:|---:|
@@ -379,22 +430,33 @@ The paper-listed hard rows are summarized separately because these are the
 numbers most directly comparable to the TRL benchmark table. They are generated
 from `exp/bmm_advanced_policy_table.md`.
 
-| environment | paper TRL overall | ours | caveat |
+| environment | paper TRL overall | ours | protocol / qualifier |
 |---|---:|---:|---|
 | puzzle-4x4-play-oraclerep | 34.0% | 97.3% (73/75) | singular-board GF(2) solve plus learned local controller |
 | puzzle-4x5-play-oraclerep | 97.0% | 100.0% (75/75) | exact discrete planner plus learned local controller |
 | puzzle-4x6-play-oraclerep | 51.0% | 92.0% (69/75) | exact discrete planner plus learned local controller |
 | humanoidmaze-medium-navigate-oraclerep | 57.0% | 94.7% (71/75) | official 2000-step horizon |
 | humanoidmaze-large-navigate-oraclerep | 8.0% | 89.3% (67/75) | official 2000-step horizon |
-| humanoidmaze-giant-navigate-oraclerep | 79.0% | 80.0% (60/75) | calibrated BMM/support route selection |
-| scene-play-oraclerep | 77.0% | 88.0% (66/75) | train-only oracle-representation graph plus local GCFBC controller |
+| humanoidmaze-giant-navigate-oraclerep | 79.0% | 82.7% (62/75) | calibrated BMM/support route selection |
+| scene-play-oraclerep | 77.0% | 86.7% (65/75) | train-only oracle-representation graph plus local GCFBC controller; task-2-only controller RNG reset |
 | cube-single-play-oraclerep | 95.0% | 98.7% (74/75) | direct local GCFBC controller |
 | cube-double-play-oraclerep | 30.0% | 73.3% (55/75) | dynamic sequential block subgoals plus learned local controller |
-| antsoccer-arena-navigate-oraclerep | 73.0% | 77.3% (58/75) | task-routed support-graph subgoals plus learned local controller |
+| antsoccer-arena-navigate-oraclerep | 73.0% | 90.7% (68/75) | same 1M TRL/RPG actor; BMM subgoal selection; support control 59/75 |
 
 For HumanoidMaze-giant, the calibrated selector's heldout offset smokes reach
-13/15, 12/15, 12/15, and 12/15, using a first-class start-distance-plus-delta-y route selector
-rather than the exploratory crossing-rule artifact.
+13/15, 12/15, 12/15, 12/15, and 12/15, before an offset-30 stress test drops
+to 8/15. These runs use a first-class start-distance-plus-delta-y route selector
+rather than the exploratory crossing-rule artifact, and the stress-test failure
+keeps this claim in the calibrated route-selection category rather than a
+fully robust Giant solution. A paired offset-30 diagnostic reaches 10/15 with
+pure BMM, 10/15 with pure support-path, and 14/15 with their oracle union,
+pointing to robust route extraction as one remaining issue. A follow-up with
+the same fitted route rule but `subgoal_commit_steps=10` reaches 14/15 on
+offset 30 and gives heldout windows 15/18/21/24/27/30 of
+13/15, 13/15, 11/15, 14/15, 13/15, and 14/15, so the stress failure is also a
+replanning-schedule sensitivity. The full corrected 75-rollout commit10 run
+reaches 62/75 (82.7%), improving the headline while leaving task 4 and task 5
+as the remaining per-task gaps.
 
 For Cube-Double, the direct local controller reaches only 18.7%, so the
 artifact-backed result uses oracle-representation block decomposition with
@@ -402,14 +464,14 @@ dynamic retries toward the currently unsolved block. The overall row beats the
 paper target, but task 4 remains the weakest swap case under this extraction
 protocol.
 
-For AntSoccer, the best clean single-protocol full result is 52/75 (69.3%),
-below the paper's 73.0% overall row. The 58/75 result is a task-routed
-support-only policy suite from one full 75-rollout artifact: tasks 1--4 use the
-100k support-path controller, while task 5 uses the same controller with a
-task-specific switch distance and task-5-only controller RNG reset. The best
-BMM-including routed suite is 55/75 (73.3%). This should be reported as task-routed
-support-graph subgoals, not as a single uniform policy-extraction or pure-BMM
-result.
+For AntSoccer, direct paper-style TRL/RPG policy extraction at 1M reaches
+53/75 (70.7%), below the paper's 73.0% overall row. BMM graph subgoals with
+that same fixed 1M TRL/RPG actor reach 68/75 (90.7%). A matched support-path
+control with the same fixed actor and task-specific switch schedule reaches
+59/75 on the promoted block, and offset blocks 0/15/30 give 192/225 for BMM
+versus 182/225 for matched support. This should be reported as fixed low-level
+policy plus BMM high-level subgoal selection, not as a new end-to-end
+actor-extraction method.
 
 The cleanest BMM-specific policy evidence is in the PointMaze navigate/stitch
 settings where BMM beats geometric and, in large stitch, a support-path-only
@@ -422,7 +484,14 @@ fixed-reset smoke, not as a full OGBench benchmark score. The HumanoidMaze-giant
 row should be reported as calibrated route selection rather than pure BMM
 routing.
 
-## 6. Discussion
+There is not one universal low-level actor across all headline rows. Fairness is
+per interface: AntSoccer and HumanoidMaze fixed-actor rows keep a TRL/RPG actor
+fixed while changing high-level subgoal selection; Puzzle, Scene-Play, and Cube
+rows use local GCFBC or structured controllers and should be read as
+policy-interface demonstrations rather than same-extraction TRL actor
+comparisons.
+
+## 7. Discussion
 
 ### What the current evidence supports
 
@@ -459,7 +528,7 @@ use exact discrete puzzle structure, and
 HumanoidMaze-giant matches the paper row only with calibrated BMM/support route
 selection.
 
-## 7. Limitations and Future Work
+## 8. Limitations and Future Work
 
 1. **Automatic support construction.** Current support graphs depend on
    representation choice, binning, horizon scaling, and support margins.
@@ -476,7 +545,7 @@ selection.
    75-rollout hard-task validations, but it is still not a full multi-seed
    OGBench benchmark table under standardized policy extraction.
 
-## 8. Conclusion
+## 9. Conclusion
 
 BMM-TRL reframes transitive value learning around finite-budget reachability.
 This changes the ideal composition rule from product/additive distance

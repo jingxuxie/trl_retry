@@ -580,39 +580,49 @@ class GCDataset:
         if num_pairs <= 0 or len(budgets) < 2:
             return
 
-        valid_idxs = self.dataset.valid_idxs.astype(np.int32)
-        valid_remaining = (
-            self.terminal_locs[np.searchsorted(self.terminal_locs, valid_idxs)]
-            - valid_idxs
-        ).astype(np.int32)
-
-        fallback_idx = int(valid_idxs[0])
-        source_idxs = np.full((num_pairs, batch_size), fallback_idx, dtype=np.int32)
-        goal_idxs = np.full((num_pairs, batch_size), fallback_idx + 1, dtype=np.int32)
-        pos_budgets = np.zeros((num_pairs, batch_size), dtype=np.int32)
-        neg_budgets = np.zeros((num_pairs, batch_size), dtype=np.int32)
-        offsets = np.ones((num_pairs, batch_size), dtype=np.int32)
-        valids = np.zeros((num_pairs, batch_size), dtype=np.float32)
-
-        for pair_idx in range(num_pairs):
-            pos_budget_idxs = 1 + np.random.randint(
-                len(budgets) - 1, size=batch_size
+        rank_cache = getattr(self, "_bmm_rank_valid_cache", None)
+        if rank_cache is None:
+            valid_idxs = self.dataset.valid_idxs.astype(np.int32)
+            valid_remaining = (
+                self.terminal_locs[np.searchsorted(self.terminal_locs, valid_idxs)]
+                - valid_idxs
+            ).astype(np.int32)
+            order = np.argsort(valid_remaining, kind="stable")
+            rank_cache = (
+                valid_idxs[order],
+                valid_remaining[order],
+                int(valid_idxs[0]),
             )
-            for batch_idx, pos_budget_idx in enumerate(pos_budget_idxs):
-                h_pos = int(budgets[pos_budget_idx])
-                h_neg = int(budgets[pos_budget_idx - 1])
-                offset = h_neg + 1 + int(np.random.randint(h_pos - h_neg))
-                eligible = valid_idxs[valid_remaining >= offset]
-                pos_budgets[pair_idx, batch_idx] = h_pos
-                neg_budgets[pair_idx, batch_idx] = h_neg
-                offsets[pair_idx, batch_idx] = offset
-                if len(eligible) == 0:
-                    continue
+            self._bmm_rank_valid_cache = rank_cache
+        sorted_valid_idxs, sorted_remaining, fallback_idx = rank_cache
 
-                src = int(eligible[np.random.randint(len(eligible))])
-                source_idxs[pair_idx, batch_idx] = src
-                goal_idxs[pair_idx, batch_idx] = src + offset
-                valids[pair_idx, batch_idx] = 1.0
+        pos_budget_idxs = 1 + np.random.randint(
+            len(budgets) - 1, size=(num_pairs, batch_size)
+        )
+        pos_budgets = budgets[pos_budget_idxs].astype(np.int32)
+        neg_budgets = budgets[pos_budget_idxs - 1].astype(np.int32)
+        widths = np.maximum(pos_budgets - neg_budgets, 1)
+        offsets = (
+            neg_budgets
+            + 1
+            + np.floor(np.random.rand(num_pairs, batch_size) * widths).astype(np.int32)
+        )
+
+        starts = np.searchsorted(sorted_remaining, offsets.reshape(-1), side="left")
+        counts = len(sorted_valid_idxs) - starts
+        valid_flat = counts > 0
+
+        sample_positions = np.zeros_like(starts)
+        sample_positions[valid_flat] = starts[valid_flat] + np.floor(
+            np.random.rand(valid_flat.sum()) * counts[valid_flat]
+        ).astype(np.int32)
+        sampled_sources = np.full_like(starts, fallback_idx, dtype=np.int32)
+        sampled_sources[valid_flat] = sorted_valid_idxs[sample_positions[valid_flat]]
+
+        source_idxs = sampled_sources.reshape(num_pairs, batch_size)
+        goal_idxs = source_idxs + offsets
+        valids = valid_flat.reshape(num_pairs, batch_size).astype(np.float32)
+        goal_idxs = np.where(valids > 0, goal_idxs, fallback_idx + 1).astype(np.int32)
 
         batch["value_rank_observations"] = self.get_observations(source_idxs)
         batch["value_rank_actions"] = self.dataset["actions"][source_idxs]
